@@ -1,3 +1,19 @@
+## v1.8.2 (2026-09-08)
+
+hermes v0.21.1 (tag v2026.9.7) 升级冲击适配版 — 纯测试与文档，零运行时代码改动。hermes v2026.9.7 进行了大规模文件分解（2 万行级大文件拆成十几个模块），触发本插件 2 个集成哨兵报警（30 用例中 2 failed / 25 passed / 3 skipped）。经三方独立审计（hermes hook/session 机制审计、adapter patch 点审计、测试与文档影响面审计）+ 行为级验证（插件经 hermes 真实加载入口装上真 v0.21.1 源码，41 项检查全过）确认：**生产 patch 面 100% 兼容，报警全部源于哨兵检测地址过时**（盯着的 hermes 内部符号搬家了，名字还在新地址用着）。本版将 2 个哨兵的检测面迁移到 hermes 新布局，CI 恢复全绿。
+
+| 类型 | 问题/功能 | 原因 | 修复/说明 |
+|------|-----------|------|-----------|
+| 🧪 Test | **集成哨兵 `test_run_conversation_has_persist_user_timestamp_param` 报警**（原名 `test_run_agent_has_persist_user_timestamp_param`）：hermes v0.21.1 将 `GatewayRunner._run_agent` 泛化为 `(self, message, context_prompt, history, source, session_id, **turn_kwargs)`，persist_* 参数移入 **turn_kwargs 透传，不再显式出现在 `_run_agent` 签名中——哨兵在旧地址找参数必然失明 | 哨兵检测点与插件生产检测点脱节 | 检测面迁移到插件生产代码真实用 `inspect.signature` 探测的两个位置（`AIAgent.run_conversation` + `agent.conversation_loop.run_conversation`，v0.17.0~v0.21.1 全程显式声明）；import 层 + AST 三候选 fallback（run_agent→AIAgent / agent.turn_facade→TurnFacadeMixin / agent.conversation_loop 模块级），候选文件旧版缺失自动跳过 (`tests/integration/test_hermes_compat.py`) |
+| 🧪 Test | **集成哨兵 `test_aiagent_callback_attributes` 报警**：hermes v0.21.1 把 5 个 AIAgent 回调属性的赋值点从 run_agent.py / agent/conversation_loop.py 迁到 `gateway/run_turn_runner.py`（`_wire_turn_agent_callbacks`）和 `agent/agent_init.py`，旧 2 文件扫描面上 `ast.Attribute` 节点数归零 | AST 扫描面未随 hermes 赋值点迁移 | 两层验证重构：Tier 1（import 层）断言 `AIAgent.__init__` 构造签名含 4 个回调构造参——这才是"agent 实例携带回调属性"的真实契约（v0.17.0~v0.21.1 一致）；Tier 2（AST 层）按候选列表 `[run_agent, agent.conversation_loop, gateway.run_turn_runner, agent.agent_init]` 取并集，维持"全空才 fail"语义（v0.21.1 并集 4/5、v0.21.0 并集 5/5，候选缺失自动跳过，纯增量）(`tests/integration/test_hermes_compat.py`) |
+| 🧪 Test | **`persist_user_message` 参数验证从 skip 恢复为硬验证**：v0.21.1 泛化 `_run_agent` 后该参数在 `_run_agent` 签名中消失（旧测试条件 skip），但在 run_conversation 双生产面仍显式声明 | 旧检测点（_run_agent）过时 | 与 persist_user_timestamp 同步迁移检测面；v0.21.1 上从 skip 恢复为 passed——两版本测试计数对称（v0.21.0 / v0.21.1 均 28 passed + 2 skipped，剩余 2 skip 为 v0.20.5+ 反应方法私有化的预期跳过）(`tests/integration/test_hermes_compat.py`) |
+| 📝 Docs | 验证基线升 **hermes-agent v0.21.1（tag v2026.9.7）**：AGENT_GUIDE 概览表与版本 FAQ 两处基线表述、`test_v181_fixes.py` docstring 补 v0.21.1 复验结论 | 基线停留在 v0.21.0 | 双版本全量验证：v0.21.0 与 v0.21.1 上 940 单元 + 22 e2e + 30 集成用例全部通过（v1.8.1 修复全部版本无关）；行为级验证 41 项检查全过（真实加载路径 / 17 个 patch 点安装盘点 / invoke_hook 真实分发链 / 11 条关键调用链按 v0.21.1 真实调用形状走通 / v0.21.1 回调赋值模式包装与 late-arrival reasoning 路径）(`docs/AGENT_GUIDE.md`, `tests/test_v181_fixes.py`) |
+
+**审计方法**: 三方独立审计 + 行为级验证。①hook/session/cron 机制审计：VALID_HOOKS 集合两版本零变化（37 hook）、`pre_gateway_dispatch` 分发链逐行比对、session key 话题隔离语义逐行对齐、cron `_deliver_result` 经 scheduler.py 底部 re-export 存活；②adapter patch 点审计：FeishuAdapter 8 个 setattr 目标、RelayAdapter 2 个、HermesCompat 8 条导入路径在新版全部命中且签名零变化（含 v0.21.1 新增 `for_failure` / `finalize` / `_quick_key`+`run_generation` kwarg 全部被插件包装器 `**kwargs` 吸收）；③测试文档影响面审计：940 单元 + 22 e2e 与 hermes 版本零耦合（全假件），版本敏感面 100% 收敛在集成哨兵文件；④行为级验证：插件经 hermes 真实插件加载入口（PluginManager + PluginManifest + PluginContext + `register(ctx)`）装上真 v0.21.1 源码，17 个 patch 目标全部落位，真实 `invoke_hook` 分发链调通插件 handler，11 条关键调用链按 v0.21.1 真实调用形状全部过插件层进入真 hermes 代码（其中 FeishuAdapter.send/edit_message 完整跑通返回真实 SendResult），v0.21.1 回调赋值模式下 5 个回调包装 + 触发链 + late-arrival reasoning 全部验证通过。
+
+**运维注**: 本修复完全在测试代码与文档层，CI 工作流零改动（GitHub Actions 的 GITHUB_TOKEN 无法推送 `.github/workflows/` 变更，本修复不触碰该限制）。若需在 GitHub 侧重跑对 v2026.9.7 的集成验证：集成工作流按"hermes 新 release 才跑"去重，上次失败运行已把 last-release 缓存写为 v2026.9.7——需在 GitHub 仓库 Settings → Actions → Caches 删除 `hermes-last-release-*` 缓存后手动 Run workflow，即可对 v2026.9.7 重跑并收到绿色飞书卡片。
+
+
 ## v1.8.1 (2026-09-07)
 
 外部反馈专项审计落地版 — 对全部外部用户反馈逐项核实（3-5 轮，先验证后动手：每项均对照 v1.8.0 代码与 hermes-agent v0.21.0 源码确认真实成立才纳入修复，不成立的项本项目不处理也不记录）。本轮落地 5 项确认问题（P1×4 / P2×1），其中 3 项为多渠道/长任务场景下从未被生产流量暴露的结构性缺陷。
