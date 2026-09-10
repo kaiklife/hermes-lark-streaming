@@ -116,7 +116,7 @@ def build_gateway_card(content: str, *, category: str = "", status_label: str = 
                 "tag": "plain_text",
                 "content": f"{status_emoji} {status_label}",
                 "text_color": "turquoise",
-                "text_size": "notation",
+                "text_size": "normal",
             },
         })
 

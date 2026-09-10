@@ -214,7 +214,7 @@ def _section_title(text: str, *, color: str = "grey") -> dict:
             "tag": "lark_md",
             "content": f"**{text}**",
             "text_color": _COLOR_MAP.get(color, "grey") or "grey",
-            "text_size": "notation",
+            "text_size": "normal",
         },
     }
 
@@ -228,7 +228,7 @@ def _fold(title: str, elements: list[dict], *, expanded: bool = False, border_co
                 "tag": "plain_text",
                 "content": title,
                 "text_color": "grey",
-                "text_size": "notation",
+                "text_size": "normal",
             },
             "vertical_align": "center",
             "icon": {
@@ -253,7 +253,7 @@ def _footer_note(content: str) -> dict:
         "text": {
             "tag": "lark_md",
             "content": content,
-            "text_size": "notation",
+            "text_size": "normal",
             "text_color": "grey",
         },
     }
@@ -282,7 +282,7 @@ def build_help_card() -> dict[str, Any]:
             "text": {
                 "tag": "lark_md",
                 "content": "所有命令以 `/aowen` 开头，不经过 Hermes AI，直接由插件处理。无参数的 `/aowen` 同 `/aowen help`。",
-                "text_size": "notation",
+                "text_size": "normal",
                 "text_color": "grey",
             },
         },
@@ -396,13 +396,13 @@ def build_status_card() -> dict[str, Any]:
 
         config_elements: list[dict] = [
             _section_title("流式控制", color="blue"),
-            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(streaming_cfg), "text_size": "notation"}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(streaming_cfg), "text_size": "normal"}},
             _section_title("卡片行为", color="blue"),
-            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(card_cfg), "text_size": "notation"}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(card_cfg), "text_size": "normal"}},
             _section_title("数量限制", color="blue"),
-            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(limit_cfg), "text_size": "notation"}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(limit_cfg), "text_size": "normal"}},
             _section_title("凭证", color="blue"),
-            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(creds_cfg), "text_size": "notation"}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(creds_cfg), "text_size": "normal"}},
         ]
 
         return {
@@ -624,7 +624,7 @@ def _handle_config_reload() -> dict:
                     {"tag": "hr"},
                     _fold("错误详情（点击展开）", [
                         {"tag": "div", "text": {"tag": "lark_md",
-                          "content": f"```\n{err_text}\n```", "text_size": "notation"}},
+                          "content": f"```\n{err_text}\n```", "text_size": "normal"}},
                     ], expanded=False, border_color="red"),
                 ],
             },

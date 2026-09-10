@@ -134,7 +134,7 @@ def _streaming_element(content: str = "", *, element_id: str = STREAMING_ELEMENT
         "tag": "markdown",
         "content": content,
         "text_align": "left",
-        "text_size": "normal_v2",
+        "text_size": "heading",
         "margin": "0px 0px 0px 0px",
         "element_id": element_id,
     }
@@ -182,7 +182,7 @@ def _build_unified_panel_placeholder(*, expanded: bool = False) -> dict:
             "content": en_title,
             "i18n_content": _i18n(en_title, zh_title),
             "text_color": "grey",
-            "text_size": "notation",
+            "text_size": "normal",
         },
         elements=[{"tag": "markdown", "content": " "}],
     )
@@ -225,7 +225,7 @@ def build_panel_header(*, reasoning_rounds: list, current_reasoning_text: str = 
         "content": en_full,
         "i18n_content": _i18n(en_full, zh_full),
         "text_color": "grey",
-        "text_size": "notation",
+        "text_size": "normal",
     }
 
     # Header structure (matches _collapsible_panel; icon_position=right → grey).
@@ -322,7 +322,7 @@ def build_panel_children(*, reasoning_rounds: list, current_reasoning_text: str 
             "tag": "markdown",
             "content": zh_hint,
             "i18n_content": _i18n(en_hint, zh_hint),
-            "text_size": "notation",
+            "text_size": "normal",
         })
 
     if panel_events:
@@ -340,7 +340,7 @@ def build_panel_children(*, reasoning_rounds: list, current_reasoning_text: str 
                         "text": {
                             "tag": "lark_md",
                             "content": _truncate_reasoning(round_.text),
-                            "text_size": "notation",
+                            "text_size": "normal",
                         },
                     })
             elif kind == "tool" and idx < len(tool_steps):
@@ -362,7 +362,7 @@ def build_panel_children(*, reasoning_rounds: list, current_reasoning_text: str 
                     "text": {
                         "tag": "lark_md",
                         "content": _truncate_reasoning(current_reasoning_text),
-                        "text_size": "notation",
+                        "text_size": "normal",
                     },
                 })
 
@@ -388,7 +388,7 @@ def build_panel_children(*, reasoning_rounds: list, current_reasoning_text: str 
                         "text": {
                             "tag": "lark_md",
                             "content": _truncate_reasoning(round_.text),
-                            "text_size": "notation",
+                            "text_size": "normal",
                         },
                     })
 
@@ -405,7 +405,7 @@ def build_panel_children(*, reasoning_rounds: list, current_reasoning_text: str 
                         "text": {
                             "tag": "lark_md",
                             "content": _truncate_reasoning(current_reasoning_text),
-                            "text_size": "notation",
+                            "text_size": "normal",
                         },
                     })
 
@@ -473,7 +473,7 @@ def _build_tool_step_title(step: dict) -> dict:
         "text": {
             "tag": "lark_md",
             "content": content,
-            "text_size": "notation",
+            "text_size": "normal",
         },
     }
 
@@ -504,7 +504,7 @@ def _build_reasoning_round_title(round_index: int, elapsed_ms: float, finalized:
         "text": {
             "tag": "lark_md",
             "content": content,
-            "text_size": "notation",
+            "text_size": "normal",
         },
     }
 
@@ -519,7 +519,7 @@ def _build_tool_step_detail(step: dict) -> dict | None:
             "tag": "plain_text",
             "content": detail,
             "text_color": "grey",
-            "text_size": "notation",
+            "text_size": "normal",
         },
     }
 
@@ -550,7 +550,7 @@ def _build_tool_step_output(step: dict) -> dict | None:
         "text": {
             "tag": "lark_md",
             "content": "\n".join(lines),
-            "text_size": "notation",
+            "text_size": "normal",
         },
     }
 
@@ -613,7 +613,7 @@ def _build_error_panel(error_message: str, *, is_aborted: bool = False, expanded
     markdown_el: dict[str, Any] = {
         "tag": "markdown",
         "content": body_content,
-        "text_size": "notation",
+        "text_size": "normal",
     }
     if body_i18n is not None:
         markdown_el["i18n_content"] = body_i18n
@@ -625,7 +625,7 @@ def _build_error_panel(error_message: str, *, is_aborted: bool = False, expanded
             "content": en_label,
             "i18n_content": _i18n(en_label, zh_label),
             "text_color": "red" if not is_aborted else "orange",
-            "text_size": "notation",
+            "text_size": "normal",
         },
         elements=[markdown_el],
         vertical_spacing="8px",
@@ -651,7 +651,7 @@ def _build_background_review_panel(messages: list[str], *, expanded: bool = True
             "content": en_title,
             "i18n_content": _i18n(en_title, zh_title),
             "text_color": "grey",
-            "text_size": "notation",
+            "text_size": "normal",
         },
         elements=children,
     )
@@ -700,7 +700,7 @@ def _build_footer_elements(
             "tag": "markdown",
             "content": en_content,
             "i18n_content": _i18n(en_content, zh_content),
-            "text_size": "notation",
+            "text_size": "normal",
         },
     ]
 
@@ -807,10 +807,10 @@ def _render_footer_field(
 ) -> tuple[str | None, str | None]:
     if name == "status":
         if is_error:
-            return _T["status_error"]
+            return ("⚠️ " + _T["status_error"][0], "⚠️ " + _T["status_error"][1])
         if is_aborted:
-            return _T["status_stopped"]
-        return _T["status_completed"]
+            return ("⏸️ " + _T["status_stopped"][0], "⏸️ " + _T["status_stopped"][1])
+        return ("✅ " + _T["status_completed"][0], "✅ " + _T["status_completed"][1])
 
     if name == "elapsed":
         duration = data.get("duration", 0)

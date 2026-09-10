@@ -67,7 +67,7 @@ def _enforce_card_element_limit(
         if isinstance(child.get("content"), str) and "已折叠" in child["content"]:
             hint_idx = i
             break
-    _HINT_TEMPLATE = {"tag": "markdown", "content": "⚡ 还有 0 项已折叠", "text_size": "notation"}
+    _HINT_TEMPLATE = {"tag": "markdown", "content": "⚡ 还有 0 项已折叠", "text_size": "normal"}
     _HINT_TAG_COUNT = _count_tag_objects(_HINT_TEMPLATE)  # typically 1
     if hint_idx is None:
         total += _HINT_TAG_COUNT  # Reserve exact space for the new collapse hint
@@ -113,7 +113,7 @@ def _enforce_card_element_limit(
             children.insert(0, {
                 "tag": "markdown",
                 "content": f"⚡ 还有 {trimmed_count} 项已折叠",
-                "text_size": "notation",
+                "text_size": "normal",
             })
 
     # Update panel children in the card

@@ -229,7 +229,7 @@ def _fold(title, elements_content, *, expanded=False, border_color="grey"):
         "tag": "collapsible_panel",
         "expanded": expanded,
         "header": {
-            "title": {"tag": "plain_text", "content": title, "text_color": "grey", "text_size": "notation"},
+            "title": {"tag": "plain_text", "content": title, "text_color": "grey", "text_size": "normal"},
             "vertical_align": "center",
             "icon": {
                 "tag": "standard_icon",
