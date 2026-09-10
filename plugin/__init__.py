@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 import shutil
 from datetime import datetime
@@ -17,6 +18,47 @@ if TYPE_CHECKING:
     from hermes_cli.plugins import PluginContext
 
 _logger = logging.getLogger("hermes_lark_streaming")
+
+
+def _setup_debug_logger() -> None:
+    """插件独立 DEBUG 日志 —— 不依赖全局 logging.level。
+
+    排查卡片问题直接看 ~/.hermes/logs/hermes-lark-streaming-debug.log。
+    历史：v1.6.2 引入（本地补丁，未进仓库）→ 2026-09-10 插件升级 1.8.2 时被覆盖丢失，
+    现以 commit 形式固化到定制分支 kai-patches。
+    轮转：原实现用 FileHandler 无轮转，涨到 68MB 后停止写入 → 改 RotatingFileHandler。
+    """
+    try:
+        from hermes_cli.config import get_hermes_home  # type: ignore
+        log_dir = Path(get_hermes_home()) / "logs"
+    except Exception:
+        log_dir = Path.home() / ".hermes" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    debug_file = log_dir / "hermes-lark-streaming-debug.log"
+    # 幂等：避免重复添加 handler（插件热重载场景）
+    for h in _logger.handlers:
+        if getattr(h, "_hls_debug_file", None) == str(debug_file):
+            return
+    try:
+        fh = logging.handlers.RotatingFileHandler(
+            debug_file, maxBytes=20 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        )
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        fh._hls_debug_file = str(debug_file)  # type: ignore[attr-defined]
+        _logger.addHandler(fh)
+        # logger 自身级别必须 ≤ DEBUG，否则 handler 收不到
+        if _logger.level > logging.DEBUG or _logger.level == logging.NOTSET:
+            _logger.setLevel(logging.DEBUG)
+        _logger.debug("HLS debug file handler attached: %s", debug_file)
+    except Exception as e:  # pragma: no cover
+        _logger.warning("HLS: failed to attach debug file handler: %s", e)
+
+
+_setup_debug_logger()
+
 
 def _get_hermes_config_path() -> Path:
     """动态获取 Hermes 配置文件路径."""
