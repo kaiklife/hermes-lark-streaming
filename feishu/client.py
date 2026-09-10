@@ -123,7 +123,7 @@ CARDKIT_TRANSIENT_CODES = {
 }
 
 # 瞬态错误重试策略 — 指数退避
-_TRANSIENT_RETRY_DELAYS = (0.1, 0.3, 0.6)  # 3 次重试，递增延迟
+_TRANSIENT_RETRY_DELAYS = (0.5, 1.5, 3.0)  # 3 次重试，递增延迟
 _TRANSIENT_MAX_RETRIES = len(_TRANSIENT_RETRY_DELAYS)
 
 _ELEMENT_NOT_FOUND_RETRY_DELAYS = (0.2, 0.2, 0.2)
@@ -312,86 +312,101 @@ class FeishuClient:
 
     async def send_card_to_chat(self, chat_id: str, card: dict[str, Any]) -> str:
         """发送独立卡片到聊天（非回复），返回 message_id."""
-        request = (
-            CreateMessageRequest.builder()
-            .receive_id_type("chat_id")
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(chat_id)
-                .msg_type("interactive")
-                .content(self._dumps(card))
+        async def _do():
+            request = (
+                CreateMessageRequest.builder()
+                .receive_id_type("chat_id")
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("interactive")
+                    .content(self._dumps(card))
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
-        resp = await self._client.im.v1.message.acreate(request)
-        self._check(resp, "send_card_to_chat")
-        if resp.data and resp.data.message_id:
-            return str(resp.data.message_id)
-        raise FeishuAPIError("send_card_to_chat: response missing message_id")
+            resp = await self._client.im.v1.message.acreate(request)
+            self._check(resp, "send_card_to_chat")
+            if resp.data and resp.data.message_id:
+                return str(resp.data.message_id)
+            raise FeishuAPIError("send_card_to_chat: response missing message_id")
+
+        return await self._retry_transient("send_card_to_chat", _do)
 
     async def reply_card(self, message_id: str, card: dict[str, Any]) -> str:
         """回复消息，返回 message_id."""
-        request = (
-            ReplyMessageRequest.builder()
-            .message_id(message_id)
-            .request_body(ReplyMessageRequestBody.builder().msg_type("interactive").content(self._dumps(card)).build())
-            .build()
-        )
-        resp = await self._client.im.v1.message.areply(request)
-        self._check(resp, "reply_card")
-        if resp.data and resp.data.message_id:
-            return str(resp.data.message_id)
-        raise FeishuAPIError("reply_card: response missing message_id")
+        async def _do():
+            request = (
+                ReplyMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(ReplyMessageRequestBody.builder().msg_type("interactive").content(self._dumps(card)).build())
+                .build()
+            )
+            resp = await self._client.im.v1.message.areply(request)
+            self._check(resp, "reply_card")
+            if resp.data and resp.data.message_id:
+                return str(resp.data.message_id)
+            raise FeishuAPIError("reply_card: response missing message_id")
+
+        return await self._retry_transient("reply_card", _do)
 
     async def reply_text(self, message_id: str, text: str) -> str:
         """回复纯文本消息，返回 message_id."""
-        request = (
-            ReplyMessageRequest.builder()
-            .message_id(message_id)
-            .request_body(
-                ReplyMessageRequestBody.builder()
-                .msg_type("text")
-                .content(self._dumps({"text": text}))
+        async def _do():
+            request = (
+                ReplyMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .msg_type("text")
+                    .content(self._dumps({"text": text}))
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
-        resp = await self._client.im.v1.message.areply(request)
-        self._check(resp, "reply_text")
-        if resp.data and resp.data.message_id:
-            return str(resp.data.message_id)
-        raise FeishuAPIError("reply_text: response missing message_id")
+            resp = await self._client.im.v1.message.areply(request)
+            self._check(resp, "reply_text")
+            if resp.data and resp.data.message_id:
+                return str(resp.data.message_id)
+            raise FeishuAPIError("reply_text: response missing message_id")
+
+        return await self._retry_transient("reply_text", _do)
 
     async def reply_card_by_id(self, message_id: str, card_id: str) -> str:
         """通过 card_id 回复 CardKit 卡片消息，返回 message_id."""
-        request = (
-            ReplyMessageRequest.builder()
-            .message_id(message_id)
-            .request_body(
-                ReplyMessageRequestBody.builder()
-                .msg_type("interactive")
-                .content(self._dumps({"type": "card", "data": {"card_id": card_id}}))
+        async def _do():
+            request = (
+                ReplyMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .msg_type("interactive")
+                    .content(self._dumps({"type": "card", "data": {"card_id": card_id}}))
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
-        resp = await self._client.im.v1.message.areply(request)
-        self._check(resp, "reply_card_by_id")
-        if resp.data and resp.data.message_id:
-            return str(resp.data.message_id)
-        raise FeishuAPIError("reply_card_by_id: response missing message_id")
+            resp = await self._client.im.v1.message.areply(request)
+            self._check(resp, "reply_card_by_id")
+            if resp.data and resp.data.message_id:
+                return str(resp.data.message_id)
+            raise FeishuAPIError("reply_card_by_id: response missing message_id")
+
+        return await self._retry_transient("reply_card_by_id", _do)
 
     async def update_card(self, message_id: str, card: dict[str, Any]) -> None:
         """PATCH 更新已发送的卡片（IM PATCH 通道）."""
-        request = (
-            PatchMessageRequest.builder()
-            .message_id(message_id)
-            .request_body(PatchMessageRequestBody.builder().content(self._dumps(card)).build())
-            .build()
-        )
-        resp = await self._client.im.v1.message.apatch(request)
-        self._check(resp, "update_card")
+        async def _do():
+            request = (
+                PatchMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(PatchMessageRequestBody.builder().content(self._dumps(card)).build())
+                .build()
+            )
+            resp = await self._client.im.v1.message.apatch(request)
+            self._check(resp, "update_card")
+
+        return await self._retry_transient("update_card", _do)
 
     async def cardkit_create(self, card: dict[str, Any]) -> str:
         """创建 CardKit 实体，返回 card_id."""

@@ -39,6 +39,8 @@ from ..feishu import (
     is_terminal_api_code,
 )
 
+from ..feishu.client import _NETWORK_ERROR_BASES
+
 from .mixin import (
     _TERMINAL,
     ABORTED,
@@ -160,6 +162,9 @@ class UnifiedControllerMixin:
 
             except FeishuAPIError as e:
                 _logger.info("linear CardKit create failed: %s", e)
+                raise
+            except _NETWORK_ERROR_BASES as e:
+                _logger.info("linear CardKit create failed (network): %s", type(e).__name__)
                 raise
 
             session.flush.set_card_message_ready(True)
@@ -913,7 +918,7 @@ class UnifiedControllerMixin:
                                     _en_hint.format(trimmed_count),
                                     _zh_hint.format(trimmed_count),
                                 ),
-                                "text_size": "notation",
+                                "text_size": "normal",
                             })
                         # Update panel's elements
                         panel["elements"] = children
