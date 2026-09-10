@@ -1,0 +1,41 @@
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: kai-patches
+          fetch-depth: 0
+
+      - name: Merge upstream/github_sync into kai-patches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name  "kai-sync-bot"
+          git config user.email "bot@kaiklife.dev"
+          git remote add upstream https://github.com/Aowen-Nowor/hermes-lark-streaming.git
+          git fetch --no-tags upstream github_sync
+          if git merge --no-edit upstream/github_sync; then
+            git push origin HEAD:kai-patches
+            echo "Upstream merged into kai-patches"
+          else
+            git merge --abort
+            TITLE="sync conflict: kaiklife/hermes-lark-streaming (kai-patches)"
+            if [ "$(gh issue list --state open --search "\"$TITLE\" in:title" --json number --jq 'length')" != "0" ]; then
+              echo "open conflict issue already exists, skip"
+            else
+              gh issue create --title "$TITLE" --body "Upstream has new commits conflicting with kai-patches; auto-merge aborted. Resolve manually (fetch, merge, fix conflicts, push kai-patches), then close this issue."
+            fi
+            exit 1
+          fi
