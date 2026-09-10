@@ -93,6 +93,10 @@ async def _fallback_write_answer(
         }]
         await client.cardkit_batch_update(card_id, fallback_actions, sequence=sequence)
         return True
+    except _NETWORK_ERROR_BASES as e:
+        # 2026-09-11: 兜底路径自己也会撞网络断连，不能反过来抛异常
+        _logger.warning("HLS: fallback write answer failed (network): %s", type(e).__name__)
+        return False
     except FeishuAPIError as e:
         _logger.warning("HLS: fallback write answer failed: %s", e)
         return False
@@ -454,6 +458,14 @@ class UnifiedControllerMixin:
                         session.card_id, ANSWER_ELEMENT_ID, content, sequence=session.sequence,
                     )
                     state.answer_dirty = False
+                except _NETWORK_ERROR_BASES as e:
+                    # 2026-09-11: 网络断连 → 保留 dirty，等下次 flush / seal
+                    _logger.warning(
+                        "unified flush answer-stream network error (%s) — "
+                        "keeping dirty, card=%s",
+                        type(e).__name__, session.card_id[:12] if session.card_id else "?",
+                    )
+                    return
                 except FeishuAPIError as e:
                     if e.code == CARDKIT_STREAMING_CLOSED:
                         session._streaming_closed = True
@@ -541,6 +553,13 @@ class UnifiedControllerMixin:
                 if "panel" not in session._creation_stages and state.panel_visible:
                     session._creation_stages.add("panel")
                     session.existing_elements.add(UNIFIED_PANEL_ELEMENT_ID)
+            except _NETWORK_ERROR_BASES as e:
+                # 2026-09-11: 网络断连 → 保留 dirty，交给下轮 flush / seal
+                _logger.warning(
+                    "unified flush phase 3 network error (%s) — keeping dirty, card=%s",
+                    type(e).__name__, session.card_id[:12] if session.card_id else "?",
+                )
+                return
             except FeishuAPIError as e:
                 if e.code == CARDKIT_STREAMING_CLOSED:
                     if session._streaming_closed_logged:
@@ -732,6 +751,12 @@ class UnifiedControllerMixin:
                         )
                         state.panel_dirty = False
                         state.tool_steps_dirty = False
+                    except _NETWORK_ERROR_BASES as e:
+                        # 2026-09-11: 网络断连 → 保留 dirty，交给下面的最终 seal 重试
+                        _logger.warning(
+                            "seal drain panel network error (%s) — keeping dirty for final seal",
+                            type(e).__name__,
+                        )
                     except FeishuAPIError as e:
                         if e.code == CARDKIT_STREAMING_CLOSED:
                             _logger.info("seal drain: streaming already closed, skipping panel flush")
@@ -756,6 +781,20 @@ class UnifiedControllerMixin:
                             sequence=session.sequence,
                         )
                         state.answer_dirty = False
+                    except _NETWORK_ERROR_BASES as e:
+                        # 2026-09-11: 网络断连 → 非流式兜底写，别丢内容
+                        _logger.warning(
+                            "HLS: seal drain answer network error (%s) — falling back to "
+                            "partial_update_element card=%s",
+                            type(e).__name__, card_id[:12],
+                        )
+                        session.sequence += 1
+                        ok = await _fallback_write_answer(
+                            self._client, session.card_id, content,
+                            sequence=session.sequence,
+                        )
+                        if ok:
+                            state.answer_dirty = False
                     except FeishuAPIError as e:
                         # v1.1.1: 统一 fallback — 300309 和 300313 都改用 batch_update（不带 tag）
                         if e.code == CARDKIT_STREAMING_CLOSED or is_element_not_found_error(e):
@@ -1104,6 +1143,38 @@ class UnifiedControllerMixin:
         # ── Step 1: Wait for any in-progress flush to finish ──
         await session.flush.wait_for_flush()
 
+        # ── Step 1.5: wait for card creation BEFORE draining ──
+        # 2026-09-11 复现修复（v1.6.2 曾修过，被 v1.8.x 升级冲回 drain 之后）：
+        # 卡片创建撞网络错误时会重试十几秒。若不等就 drain，此时 card_id 还是
+        # None、answer 元素从未创建 → drain 空转 → 随后 flush 已被
+        # mark_completed 拒掉（迟到的首刷无效）→ seal 又因
+        # `"answer" not in _creation_stages` 跳过写入 → 内容只能走文本兜底
+        # （用户看到回答跑到卡片外面）。必须先等卡片就绪再 drain。
+        try:
+            await asyncio.wait_for(session._card_ready.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            _logger.warning(
+                "complete: card creation timed out before drain: msg=%s",
+                (session.message_id or "?")[:12],
+            )
+
+        if not session.card_id:
+            session.state = CREATION_FAILED
+            session.enter_terminal(
+                reason=TerminalReason.CREATION_FAILED,
+                source="_do_linear_complete",
+            )
+            return False
+
+        # 2026-09-11: _card_ready 只保证卡片已建，不保证「首刷」（创建 answer
+        # 元素的那次 flush）已完成。首刷还在飞时 drain 会因
+        # `"answer" not in _creation_stages` 直接跳过，内容只能落到 seal。
+        # 再等一次 flush 收尾：无 flush 在途时立即返回，happy path 零成本。
+        try:
+            await asyncio.wait_for(session.flush.wait_for_flush(), timeout=3.0)
+        except Exception:
+            pass  # 超时或 flush 异常 → 照旧往下走（seal 仍会兜底）
+
         # without being flushed.  We must drain it ALL here, before
         # the "footer appears before content finishes" bug.
         state = session.unified_state
@@ -1158,6 +1229,12 @@ class UnifiedControllerMixin:
                     )
                     state.panel_dirty = False
                     state.tool_steps_dirty = False
+                except _NETWORK_ERROR_BASES as e:
+                    # 2026-09-11: 网络断连 → 保留 panel_dirty，下轮 / seal 重试
+                    _logger.warning(
+                        "drain panel network error (%s) — keeping panel_dirty for retry msg=%s",
+                        type(e).__name__, (session.message_id or "?")[:12],
+                    )
                 except FeishuAPIError as e:
                     if e.code == CARDKIT_STREAMING_CLOSED:
                         # v1.2.0 Y3: drain 阶段也用 _streaming_closed_logged 去重
@@ -1201,6 +1278,20 @@ class UnifiedControllerMixin:
                         sequence=session.sequence,
                     )
                     state.answer_dirty = False
+                except _NETWORK_ERROR_BASES as e:
+                    # 2026-09-11: 网络断连 → 非流式 partial_update 兜底，别丢内容
+                    _logger.warning(
+                        "HLS: drain answer network error (%s) — falling back to "
+                        "partial_update_element msg=%s",
+                        type(e).__name__, (session.message_id or "?")[:12],
+                    )
+                    session.sequence += 1
+                    ok = await _fallback_write_answer(
+                        self._client, session.card_id, content,
+                        sequence=session.sequence,
+                    )
+                    if ok:
+                        state.answer_dirty = False
                 except FeishuAPIError as e:
                     # v1.1.1: 统一 fallback — 300309 和 300313 都改用 batch_update（不带 tag）
                     # 之前 300309 直接 skip 答案丢失；300313 的 fallback 带 tag 报 300312
@@ -1251,20 +1342,8 @@ class UnifiedControllerMixin:
             )
 
         # ── Step 3: Mark flush as completed — no more updates accepted ──
+        # （卡片就绪等待已前移到 Step 1.5，见上）
         session.flush.mark_completed()
-
-        try:
-            await asyncio.wait_for(session._card_ready.wait(), timeout=30.0)
-        except asyncio.TimeoutError:
-            _logger.warning("complete: card creation timed out: msg=%s", (session.message_id or "?")[:12])
-
-        if not session.card_id:
-            session.state = CREATION_FAILED
-            session.enter_terminal(
-                reason=TerminalReason.CREATION_FAILED,
-                source="_do_linear_complete",
-            )
-            return False
 
         # ── Step 4: Finalize state ──
         if state:

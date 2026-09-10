@@ -49,7 +49,11 @@ def _make_session(message_id: str = "msg", chat_id: str = "chat") -> CardSession
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
-    return CardSession(message_id, chat_id, loop)
+    session = CardSession(message_id, chat_id, loop)
+    # 2026-09-11: _do_linear_complete 现在会先等 _card_ready 再 drain；
+    # 夹具不置位的话相关用例会空转 30s（单测不该等真实超时）。
+    session._card_ready.set()
+    return session
 
 
 # ══════════════════════════════════════════════════════════════════════
