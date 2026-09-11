@@ -10,6 +10,26 @@ from typing import Any, Optional
 
 _logger = logging.getLogger("hermes_lark_streaming")
 
+
+def _module_if_loaded(name: str) -> Any | None:
+    """The module at *name* only if it FINISHED importing — never triggers an import.
+
+    Plugin registration runs inside another module's import whenever that module's body
+    triggers plugin discovery (``gateway/run.py`` does). Importing *that* module here, or
+    touching a half-imported one, blocks on its import lock until the importing thread
+    finishes — and that thread is waiting for registration: deadlock. ``sys.modules`` holds
+    partially initialized modules during their own import; ``__spec__._initializing`` is the
+    flag for that window, so it reads as "not available yet" and the caller defers.
+    """
+    mod = sys.modules.get(name)
+    if mod is None:
+        return None
+    spec = getattr(mod, "__spec__", None)
+    if spec is not None and getattr(spec, "_initializing", False):
+        return None
+    return mod
+
+
 class HermesCompat:
     """Encapsulates all Hermes internal module access."""
     
@@ -48,11 +68,16 @@ class HermesCompat:
         self.conversation_loop_func: Any | None = None
         self.run_agent_module: Any | None = None
         
-        # GatewayRunner
-        try:
-            from gateway.run import GatewayRunner
-            self.gateway_runner_class = GatewayRunner
-        except (ImportError, AttributeError):
+        # GatewayRunner — looked up, never imported: this runs during plugin registration,
+        # which gateway.run itself triggers from its own module body (the import-time
+        # config→env bridge in gateway/run.py). A `from gateway.run import GatewayRunner`
+        # here waits on that module's import lock while the importing thread waits for us
+        # to finish registering → startup deadlock (the startup watchdog then kills the
+        # boot with TEMPFAIL and the service only comes up on a later retry).
+        # Absent or half-imported → None; patching/__init__.py starts its delayed poll and
+        # patches as soon as the module is complete.
+        self.gateway_runner_class = getattr(_module_if_loaded("gateway.run"), "GatewayRunner", None)
+        if self.gateway_runner_class is None:
             _logger.debug("HLS: GatewayRunner not available yet")
         
         # AIAgent
@@ -109,8 +134,9 @@ class HermesCompat:
     
     def _resolve_conversation_loop(self) -> None:
         """Resolve agent.conversation_loop, handling Apple Silicon namespace collision."""
-        # Strategy 1: sys.modules cache
-        cl_mod = sys.modules.get("agent.conversation_loop")
+        # Strategy 1: sys.modules cache (finished modules only — a half-imported one would
+        # hand us a module whose attributes are not attached yet)
+        cl_mod = _module_if_loaded("agent.conversation_loop")
         if cl_mod is not None:
             func = getattr(cl_mod, "run_conversation", None)
             if func is not None:
@@ -119,14 +145,12 @@ class HermesCompat:
                 _logger.debug("HLS: conversation_loop resolved via sys.modules")
                 return
         
-        # Strategy 2: Anchor-based discovery
+        # Strategy 2: Anchor-based discovery (sys.modules only — importing an anchor here
+        # would repeat the register-time deadlock documented in ``_module_if_loaded``).
         for anchor_name in ("gateway.run", "run_agent"):
-            anchor = sys.modules.get(anchor_name)
+            anchor = _module_if_loaded(anchor_name)
             if anchor is None:
-                try:
-                    anchor = importlib.import_module(anchor_name)
-                except ImportError:
-                    continue
+                continue
             anchor_file = getattr(anchor, "__file__", None)
             if not anchor_file:
                 continue
