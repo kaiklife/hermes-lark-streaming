@@ -312,8 +312,15 @@ def register(ctx: "PluginContext") -> None:
         _logger.debug("hermes-lark-streaming v%s: /aowen hook registration skipped", __version__, exc_info=True)
 
 def unregister(ctx: "PluginContext") -> None:
-    """Unregister — clean up injected config and clear sessions."""
-    _cleanup_config()
+    """Drop runtime state on unload.
+
+    Deliberately does NOT call ``_cleanup_config()``: ``unregister`` runs on every
+    plugin unload — ``discover_and_load(force=True)`` reloads, and process teardown —
+    and that cleanup deletes this plugin's own ``plugins.enabled`` entry, so the NEXT
+    boot reads it as disabled and silently skips it: streaming cards disappear while
+    the gateway still looks healthy (2026-09-11 incident). Explicit removal is the
+    CLI ``cleanup`` command in ``__main__.py``.
+    """
     try:
         from ..controller import get_controller
         ctrl = get_controller()
