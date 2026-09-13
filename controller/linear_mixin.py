@@ -1135,6 +1135,86 @@ class UnifiedControllerMixin:
             )
             return False
 
+    async def _recreate_answer_element(
+        self, session: CardSession, state: UnifiedLinearState,
+    ) -> bool:
+        """卡片已就绪但 answer 元素从未创建时，就地补建它。
+
+        2026-09-14：撞的是第 3 类根因（卡片创建期网络错误）——创建请求重试十几秒，
+        这期间模型回答已跑完、首刷也已失败结束（Step 1.5/1.6 等不到任何在途 flush），
+        于是 drain（要求 `"answer" in _creation_stages`）与 seal 双双静默跳过，
+        正文只能作为普通文本消息补发 —— 用户看到「卡片是空的、消息跑到卡片外面」。
+
+        这里把元素补建出来，让后续 drain/seal 走正常写入路径（补建失败才继续走文本兜底）。
+        """
+        if "answer" in session._creation_stages:
+            return True
+        if not session.card_id or not state.answer_text:
+            return False
+        assert self._client is not None
+
+        new_elements: list[dict[str, Any]] = []
+        if state.panel_visible:
+            new_elements.append(build_unified_panel(
+                reasoning_rounds=state.reasoning_rounds,
+                current_reasoning_text=state.current_reasoning_text,
+                tool_steps=session.tool_use.build_display_steps(),
+                tool_elapsed_ms=session.tool_use.elapsed_ms,
+                show_reasoning=self._cfg.show_reasoning,
+                expanded=self._cfg.streaming_panel_expanded,
+                panel_events=state.panel_events,
+                max_tool_steps=self._cfg.max_tool_steps,
+                max_reasoning_rounds=self._cfg.max_reasoning_rounds,
+            ))
+        new_elements.append(_streaming_element(element_id=ANSWER_ELEMENT_ID))
+
+        _insert_target = (
+            _LOADING_HINT_ELEMENT_ID
+            if _LOADING_HINT_ELEMENT_ID in session.existing_elements
+            else _LOADING_ELEMENT_ID
+        )
+        actions: list[dict[str, Any]] = [{
+            "action": "add_elements",
+            "params": {
+                "type": "insert_before",
+                "target_element_id": _insert_target,
+                "elements": new_elements,
+            },
+        }]
+        if _LOADING_HINT_ELEMENT_ID in session.existing_elements:
+            actions.append({
+                "action": "delete_elements",
+                "params": {"element_ids": [_LOADING_HINT_ELEMENT_ID]},
+            })
+
+        _has_panel = state.panel_visible
+        session.sequence += 1
+        try:
+            await self._client.cardkit_batch_update(
+                session.card_id, actions, sequence=session.sequence,
+            )
+        except (*_NETWORK_ERROR_BASES, FeishuAPIError) as e:
+            _logger.warning(
+                "complete: recreate answer element failed card=%s: %s",
+                (session.card_id or "?")[:12], e,
+            )
+            return False
+
+        session._creation_stages.add("answer")
+        session._creation_stages.add("hint_removed")
+        session.existing_elements.add(ANSWER_ELEMENT_ID)
+        if _has_panel:
+            session._creation_stages.add("panel")
+            session.existing_elements.add(UNIFIED_PANEL_ELEMENT_ID)
+        session.existing_elements.discard(_LOADING_HINT_ELEMENT_ID)
+        state.panel_dirty = False
+        state.tool_steps_dirty = False
+        _logger.info(
+            "complete: recreated missing answer element card=%s len=%d",
+            (session.card_id or "?")[:12], len(state.answer_text),
+        )
+        return True
+
     async def _do_linear_complete(self, session: CardSession) -> bool:
         """Complete the card with the unified panel architecture."""
         if session.guard.should_skip("_do_linear_complete"):
@@ -1174,6 +1254,30 @@ class UnifiedControllerMixin:
             await asyncio.wait_for(session.flush.wait_for_flush(), timeout=3.0)
         except Exception:
             pass  # 超时或 flush 异常 → 照旧往下走（seal 仍会兜底）
+
+        # ── Step 1.6: 卡片已就绪但 answer 元素从未创建 → 就地补建 + 写入 ──
+        # 2026-09-14（用户报「卡片是空的、消息在卡片外」）：卡片创建撞网络错误重试
+        # 十几秒，首刷在那个窗口里已经失败结束，Step 1.5/1.6 都等不到在途 flush，
+        # 元素永远不会被创建 → drain/seal 静默跳过 → 正文走文本兜底发到卡片外面。
+        # 这里补建元素，让卡片拿回正文（补建/写入失败才退回原来的文本兜底）。
+        state = session.unified_state
+        if (
+            state is not None
+            and state.answer_text
+            and "answer" not in session._creation_stages
+        ):
+            if await self._recreate_answer_element(session, state):
+                session.sequence += 1
+                if not await _fallback_write_answer(
+                    self._client,
+                    session.card_id or "",
+                    state.answer_text,
+                    sequence=session.sequence,
+                ):
+                    _logger.warning(
+                        "complete: answer element recreated but write failed card=%s",
+                        (session.card_id or "?")[:12],
+                    )
 
         # without being flushed.  We must drain it ALL here, before
         # the "footer appears before content finishes" bug.
