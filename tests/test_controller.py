@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import httpx
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1626,3 +1627,90 @@ async def test_v134_aborted_session_keeps_aborted_state() -> None:
 
     # v1.3.4 fix: aborted session 应保持 ABORTED
     assert session.state == ABORTED, f"Expected ABORTED, got {session.state}"
+
+
+class TestSealNetworkFallback:
+    """2026-09-14 — seal 路径必须接住 httpx 网络异常（`_NETWORK_ERROR_BASES`）。
+
+    漏抓的后果：异常从 `except FeishuAPIError` 处理器内部穿透到
+    `_preservative_seal` 函数级 `except Exception` → return False → 上层判
+    CREATION_FAILED → 整段回答当文本重发，卡片内外各一份（用户 2026-09-13 报的
+    「卡片输出了一段，非卡片消息也输出了」）。
+    """
+
+    def _seal_session(
+        self, ctrl, msg_id: str, *, streaming_closed: bool = False,
+    ) -> CardSession:
+        session = _make_session(msg_id, linear=True)
+        session.card_id = f"card_{msg_id}"
+        session.state = STREAMING
+        session._creation_stages.update({"panel", "answer", "hint_removed"})
+        session.existing_elements = {ANSWER_ELEMENT_ID, UNIFIED_PANEL_ELEMENT_ID}
+        session.unified_state.answer_text = "这是完整的回答内容，不应被重发。"
+        session.unified_state.answer_dirty = False
+        session._streaming_closed = streaming_closed
+        ctrl._sessions[msg_id] = session
+        return session
+
+    async def _seal(self, ctrl, session: CardSession) -> bool:
+        return await ctrl._preservative_seal(
+            session,
+            footer_data={"duration": 1.0, "model": "test"},
+            is_error=False,
+            is_aborted=False,
+            error_message="",
+            footer_fields=[["status", "elapsed"]],
+            footer_show_label=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_close_streaming_network_error_still_seals(self) -> None:
+        """close_streaming 撞断网 → seal 仍返回 True（不再穿透成 CREATION_FAILED）。"""
+        ctrl = _setup_ctrl(linear=True)
+        session = self._seal_session(ctrl, "msg_net_close")
+        ctrl._client.cardkit_close_streaming = AsyncMock(
+            side_effect=httpx.ConnectError("connection reset by peer")
+        )
+
+        result = await self._seal(ctrl, session)
+
+        assert result is True, "网络断连不该把已渲染的卡片判成封卡失败"
+        # 守卫断言：确保这条路径真的调到了 close_streaming（否则 mock 永不触发，
+        # 重构后本测试会变成空洞绿）
+        assert ctrl._client.cardkit_close_streaming.await_count == 1
+        assert ctrl._client.cardkit_batch_update.await_count >= 1, "正文须已写入卡片"
+
+    @pytest.mark.asyncio
+    async def test_summary_network_error_when_already_closed_still_seals(self) -> None:
+        """流已关闭时摘要更新撞断网 → 摘要失败不影响封卡成败。"""
+        ctrl = _setup_ctrl(linear=True)
+        session = self._seal_session(ctrl, "msg_net_summary", streaming_closed=True)
+        ctrl._client.cardkit_update_summary = AsyncMock(
+            side_effect=httpx.ReadTimeout("read timed out")
+        )
+
+        result = await self._seal(ctrl, session)
+
+        assert result is True, "摘要只是锦上添花，不该判封卡失败"
+        # 守卫断言：确保「已关闭」分支真的走到了摘要更新（否则 mock 是死代码，
+        # pre-fix 直接绿 = 空洞绿）
+        assert ctrl._client.cardkit_update_summary.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_sequence_conflict_retry_network_error_returns_false(self) -> None:
+        """sequence 冲突 retry 中撞断网 → 不穿透，返回 False 交上层覆盖式补写。"""
+        ctrl = _setup_ctrl(linear=True)
+        session = self._seal_session(ctrl, "msg_net_retry")
+        ctrl._client.cardkit_batch_update = AsyncMock(
+            side_effect=[FeishuAPIError("seq conflict", code=CARDKIT_SEQUENCE_CONFLICT)]
+            + [None] * 4
+        )
+        ctrl._client.cardkit_close_streaming = AsyncMock(
+            side_effect=httpx.RemoteProtocolError("server disconnected")
+        )
+
+        result = await self._seal(ctrl, session)
+
+        assert result is False, (
+            "retry 撞断网应返回 False（让上层覆盖式补写回卡片，而不是立刻重发一条文本）"
+        )
