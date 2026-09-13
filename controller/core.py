@@ -11,7 +11,7 @@ from concurrent.futures import Future as ConcurrentFuture
 from typing import TYPE_CHECKING, Any
 
 from ..config import Config
-from .linear_mixin import UnifiedControllerMixin
+from .linear_mixin import UnifiedControllerMixin, _fallback_write_answer
 from .mixin import (
     ABORTED,
     COMPLETED,
@@ -1003,7 +1003,11 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         try:
             result = await self._do_linear_complete(session)
             if not result:
-                await self._send_text_fallback(session, fallback_text=_fallback_text)
+                # 2026-09-14（用户报「卡片输出了一段，非卡片消息也输出了」）：
+                # 卡片里已经渲染过正文时，再整段文本兜底 = 重复投递。
+                # 先把正文覆盖式补写回卡片（幂等覆盖，不产生重复）；写成功就不发文本。
+                if not await self._rewrite_answer_into_card(session, _fallback_text):
+                    await self._send_text_fallback(session, fallback_text=_fallback_text)
         except Exception:
             _logger.warning(
                 "linear complete with fallback failed: msg=%s",
@@ -1011,6 +1015,33 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
                 exc_info=True,
             )
             await self._send_text_fallback(session, fallback_text=_fallback_text)
+
+    async def _rewrite_answer_into_card(self, session: CardSession, text: str) -> bool:
+        """封卡失败但卡片尚有正文元素时，把正文覆盖式补写回卡片。
+
+        2026-09-14：修「卡片输出了一段，非卡片消息也输出了」——封卡（seal）撞网络断连
+        导致 `_do_linear_complete` 返回 False 时，上层原本无脑把整段回答当文本重发，
+        而卡片里已经渲染了一部分 → 用户看到重复。这里改成：卡片已有 answer 元素
+        （说明正文已经建好/渲染过）就先覆盖式补写（幂等，不产生第二条消息），
+        写成功就完全跳过文本兜底；元素压根没建出来或写入失败才回到文本兜底。
+        """
+        if not self._client or not session.card_id:
+            return False
+        if "answer" not in session._creation_stages:
+            return False  # 元素从未创建 = 卡片是空的，文本兜底才是对的
+        if not (text or "").strip():
+            return False
+        session.sequence += 1
+        ok = await _fallback_write_answer(
+            self._client, session.card_id, text, sequence=session.sequence,
+        )
+        if ok:
+            _logger.info(
+                "complete fallback: answer re-written into card=%s len=%d "
+                "(text fallback skipped to avoid duplicate)",
+                session.card_id[:12], len(text),
+            )
+        return ok
 
     async def _send_text_fallback(self, session: CardSession, *, fallback_text: str = "") -> None:
         """卡片不可用时，通过飞书 API 发送文本回复作为兜底."""

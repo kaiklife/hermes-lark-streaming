@@ -974,9 +974,22 @@ class UnifiedControllerMixin:
 
             if seal_actions:
                 session.sequence += 1
-                await self._client.cardkit_batch_update(
-                    card_id, seal_actions, sequence=session.sequence,
-                )
+                try:
+                    await self._client.cardkit_batch_update(
+                        card_id, seal_actions, sequence=session.sequence,
+                    )
+                except _NETWORK_ERROR_BASES as e:
+                    # 2026-09-14（用户报「卡片输出了一段，非卡片消息也输出了」）：这个
+                    # seal 主 batch_update 此前没有任何网络异常兜底，连接被断时异常直接
+                    # 穿透到最外层 `except Exception` → 判 CREATION_FAILED → 上层把整段
+                    # 回答当文本重发 → 与卡片里已经渲染的部分重复。
+                    # 语义对齐兄弟路径：接住网络错误、保留卡片现状（已写入的正文留着），
+                    # 继续往下走 close_streaming；close 再失败才由上层兜底。
+                    _logger.warning(
+                        "preservative seal: batch_update hit network error card=%s: %s "
+                        "— keep rendered content, continue sealing",
+                        card_id[:12], type(e).__name__,
+                    )
 
             # When closing streaming, we MUST also update the card's summary
             # bug the user reported.
