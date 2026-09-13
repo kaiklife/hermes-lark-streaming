@@ -382,6 +382,17 @@ class UnifiedControllerMixin:
                                     summary="",
                                 )
                                 session._streaming_closed = True
+                            except _NETWORK_ERROR_BASES as ce:
+                                # 2026-09-14: 这段在 Phase 2 的 except 块内部，抛出的
+                                # 网络异常不会被同级 except 接住，会直接逃出
+                                # _do_unified_flush 打断整个 flush 任务。close 失败
+                                # 无需上报：_streaming_closed 保持 False，seal 仍会重试。
+                                _logger.warning(
+                                    "schema-error close_streaming hit network error (%s) "
+                                    "card=%s — keep streaming open, seal will retry",
+                                    type(ce).__name__,
+                                    session.card_id[:12] if session.card_id else "?",
+                                )
                             except FeishuAPIError:
                                 _logger.debug(
                                     "schema-error close_streaming failed card=%s",
@@ -634,6 +645,16 @@ class UnifiedControllerMixin:
                     session.card_id, ANSWER_ELEMENT_ID, content, sequence=session.sequence,
                 )
                 state.answer_dirty = False
+            except _NETWORK_ERROR_BASES as e:
+                # 2026-09-14: 与上方 Phase 2 流式区同构 — 网络断连时保留
+                # answer_dirty（异常穿透会打断 flush 任务），交给下轮 flush /
+                # seal drain 重试，正文不会因为一次断网丢在内存里。
+                _logger.warning(
+                    "unified flush phase 3 answer-stream network error (%s) — "
+                    "keeping dirty, card=%s",
+                    type(e).__name__, session.card_id[:12] if session.card_id else "?",
+                )
+                return
             except FeishuAPIError as e:
                 if e.code == CARDKIT_STREAMING_CLOSED:
                     if session._streaming_closed_logged:
@@ -1006,10 +1027,22 @@ class UnifiedControllerMixin:
                 )
                 # ── Bug fix (v1.0.3): Pass summary IN close_streaming ──
                 # must be in THIS request — passing summary="" and then
-                await self._client.cardkit_close_streaming(
-                    card_id, sequence=session.sequence, summary=seal_summary,
-                )
-                session._streaming_closed = True
+                try:
+                    await self._client.cardkit_close_streaming(
+                        card_id, sequence=session.sequence, summary=seal_summary,
+                    )
+                    session._streaming_closed = True
+                except _NETWORK_ERROR_BASES as e:
+                    # 2026-09-14: 走到这里正文已经由上面的 seal batch_update 写进卡片
+                    # （那一处撞网络错误时是「保留现状继续封卡」的）。close 再撞断网
+                    # 若无兜底会穿透到函数级 except Exception → return False → 判
+                    # CREATION_FAILED → 整段回答当文本重发 = 卡片内外各一份。
+                    # 接住并保留卡片现状，流式收尾交给飞书侧 TTL。
+                    _logger.warning(
+                        "preservative seal: close_streaming hit network error card=%s: %s "
+                        "— keep card as rendered, skip streaming close",
+                        card_id[:12], type(e).__name__,
+                    )
             else:
                 _logger.info(
                     "preservative seal: streaming already closed, skipping close_streaming card=%s",
@@ -1026,6 +1059,14 @@ class UnifiedControllerMixin:
                             "card=%s seq=%d summary=%s",
                             card_id[:12], session.sequence,
                             repr(seal_summary[:40]),
+                        )
+                    except _NETWORK_ERROR_BASES as e:
+                        # 2026-09-14: 摘要只是锦上添花，一次断网不该把已经渲染好
+                        # 的卡片判成封卡失败（→ 上层文本重发造成重复投递）。
+                        _logger.warning(
+                            "preservative seal: summary update hit network error (%s) "
+                            "card=%s — keep card as rendered",
+                            type(e).__name__, card_id[:12],
                         )
                     except FeishuAPIError as e:
                         _logger.warning(
@@ -1118,6 +1159,20 @@ class UnifiedControllerMixin:
                             retry + 1, card_id[:12],
                         )
                         return True
+                    except _NETWORK_ERROR_BASES as retry_e:
+                        # 2026-09-14: 这条 retry 分支整个都在函数级 `except
+                        # FeishuAPIError` 处理器内部，抛出的网络异常既不会被同级
+                        # except Exception 接住、也不会被外层接住，会直接逃出
+                        # _preservative_seal → _do_linear_complete 没有 try 兜底 →
+                        # 上层 except Exception 无脑走文本兜底（连 _rewrite_answer_into_card
+                        # 都跳不过去）。接住后按「重试耗尽」同构处理：返回 False，
+                        # 让上层用覆盖式补写回卡片，而不是立刻重复发一条文本。
+                        _logger.warning(
+                            "preservative seal: retry %d hit network error card=%s: %s "
+                            "— stop retrying, let caller re-write the answer",
+                            retry + 1, card_id[:12], type(retry_e).__name__,
+                        )
+                        return False
                     except FeishuAPIError as retry_e:
                         if retry_e.code == CARDKIT_SEQUENCE_CONFLICT:
                             continue
