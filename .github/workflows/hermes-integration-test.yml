@@ -153,6 +153,14 @@ jobs:
           TRIGGER = os.environ.get("TRIGGER", "schedule")
           UPDATE  = os.environ.get("WILL_UPDATE", "false")
 
+          # 2026-09-14: 未配置 FEISHU_WEBHOOK 时直接跳过通知。通知是附属动作，
+          # 不该把「测试全绿」的流水线判成失败 —— 9/11、9/12 两次红叉的根因就是
+          # 空 webhook 传进 urllib 抛 ValueError: unknown url type: '' 且未被捕获，
+          # 脚本 exit 1 把整条 run 带红。
+          if not WEBHOOK:
+              print("FEISHU_WEBHOOK 未配置 — 跳过飞书通知（不影响流水线结论）")
+              raise SystemExit(0)
+
           run_url = f"{SERVER}/{REPO}/actions/runs/{RUN_ID}"
           trigger_label = "⏰ 定时触发" if TRIGGER == "schedule" else "👆 手动触发"
 
@@ -260,10 +268,12 @@ jobs:
           }
 
           data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-          req = urllib.request.Request(
-              WEBHOOK, data=data, headers={"Content-Type": "application/json"},
-          )
+          # 2026-09-14: Request() 构造也放进 try —— 空/非法 webhook 是在构造时就抛
+          # ValueError，原先在 try 外就等于"没兜底"。
           try:
+              req = urllib.request.Request(
+                  WEBHOOK, data=data, headers={"Content-Type": "application/json"},
+              )
               with urllib.request.urlopen(req) as resp:
                   print(f"Feishu notified: {resp.read().decode()}")
           except Exception as e:
