@@ -995,9 +995,28 @@ class UnifiedControllerMixin:
 
             if seal_actions:
                 session.sequence += 1
+                # 2026-09-19 诊断埋点：生产那张「无 footer + 正文断在半句」的卡
+                # （card 768717213663）走到的最后一环是「封卡批次 200 返回、无异常、
+                # close_streaming 正常，但飞书侧卡片没变」。真机 e2e 复现了 5 种形状
+                # 全部封住，说明不是批次内容残缺 —— 下次再犯时，这行能钉住插件当时
+                # 到底发了什么（动作种类 / 正文长度 / 是否带 footer / seq）。
+                _logger.info(
+                    "preservative seal batch: card=%s seq=%d kinds=%s answer_len=%d "
+                    "footer=%s panel=%s",
+                    card_id[:12], session.sequence,
+                    ",".join(a.get("action", "?") for a in seal_actions),
+                    len(state.answer_text) if state is not None and state.answer_text else 0,
+                    any(a.get("action") == "add_elements" for a in seal_actions),
+                    any(a.get("params", {}).get("element_id") == UNIFIED_PANEL_ELEMENT_ID
+                        for a in seal_actions),
+                )
                 try:
                     await self._client.cardkit_batch_update(
                         card_id, seal_actions, sequence=session.sequence,
+                    )
+                    _logger.info(
+                        "preservative seal batch applied: card=%s seq=%d",
+                        card_id[:12], session.sequence,
                     )
                 except _NETWORK_ERROR_BASES as e:
                     # 2026-09-14（用户报「卡片输出了一段，非卡片消息也输出了」）：这个
