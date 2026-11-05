@@ -202,8 +202,14 @@ async def finalize_card(
     footer_show_label: bool = False,
     panel_title: str = "",
     panel_expanded: bool = True,
+    skip_answer_patch: bool = False,
 ) -> None:
-    """把活跃卡片转为终态（四步，见模块 docstring）。"""
+    """把活跃卡片转为终态（四步，见模块 docstring）.
+
+    ``skip_answer_patch``（v2.0.30）：复活卡通道已走全量重建（正文随
+    cardkit_update 落卡），跳过 stream_element 终值 patch（关闭流式后
+    该接口报 300309）。
+    """
     client.cardkit_stream_element  # noqa: B018 — 提前触发 attribute 错误便于诊断
     state.seq += 1
     # v2.0.9 P0-1：三步定稿全部走 300317 自愈（answer 终值/页脚/关流式）
@@ -211,7 +217,7 @@ async def finalize_card(
     # （99992402，s152 真飞书探针定案）；纯工具回合 answer 为空是合法终态。
     # answer 元素骨架期无条件存在（空 content 占位），页脚 insert_before
     # 锚点不受影响。
-    if (state.answer_text or "").strip():
+    if (state.answer_text or "").strip() and not skip_answer_patch:
         await call_with_seq_recovery(
             state,
             lambda seq: client.cardkit_stream_element(

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -45,6 +46,11 @@ _logger = logging.getLogger("hermes_lark_streaming.composer")
 # 正常回合工具执行期网关进度气泡/native interim tick 持续重发快照刷新
 # last_activity，不会误伤（详见 _watchdog docstring）。
 _WATCHDOG_IDLE_SEC = 120.0
+
+# v2.0.30（kai fork）：同 turn 复活窗口。卡按段定稿后，同 turn_id 的后继帧在
+# 此窗口内继续写同一张卡（203 = 三次以上工具墙钟仍能落在同一卡上，超时说明
+# 这已是另一个回合的迟到帧，宁可新卡也不误拼）。
+_REVIVE_WINDOW_SEC = 600.0
 
 try:  # hermes 运行时存在；导入失败时 composer 退化为纯直通（tests / 无 hermes 环境）
     from gateway.platforms.base import SendResult  # type: ignore
@@ -102,6 +108,16 @@ class CardTurnState:
     paused: bool = False              # clarify 等待中（回调后 resume 续写同一张卡）
     resume_base: str = ""             # 暂停时正文快照（reopen 后新段快照的拼接基线）
     turn_id: str = ""                 # hermes 回合标识（transport 每帧携带；防跨回合串卡）
+    # ── v2.0.30（kai fork）─────────────────────────────────────────────
+    # rev：内容版本号。answer_text / status_lines 每次变更 +1；面板全量重建
+    # 在发请求前记下当时的 rev，网络重试迟到的旧快照据此判废（旧快照护栏）。
+    rev: int = 0
+    # finalized_at：定稿时刻（monotonic）。同 turn 内的后续帧据此判断能否
+    # 复活同一张卡（一回合多卡根治），超过窗口才允许开新卡。
+    finalized_at: float = 0.0
+    # rebuild_only：卡片 streaming 已关闭（复活卡）。后续正文更新改走全量
+    # 重建（cardkit_update），stream_element 会 300309 streaming closed。
+    rebuild_only: bool = False
 
 
 class FrameComposer:
@@ -502,6 +518,13 @@ class FrameComposer:
                         self._arm_pause_expire(chat_id)
                         return True
                 answer, progress = _split_native_composite(text)
+                # v2.0.30：漏进正文的命令回显块（```plain_text 围栏）挪进面板，
+                # 别让它们糊在答案里（2026-11-06 07:14 事故）。
+                answer, _echo = _strip_command_echo(answer)
+                if _echo:
+                    progress = list(progress) + _echo
+                # v2.0.30：同一 turn 的后继帧——复活已封的卡 / 撤销普通落定窗口
+                self._settle_new_frame(chat_id, turn_id)
                 if progress:
                     st_now = self.active_state(chat_id)
                     if st_now is not None:
@@ -590,6 +613,7 @@ class FrameComposer:
         self._attach_pending_durations(st, st.status_lines, merged)
         st.status_lines = merged[-12:]
         st.line_times = new_times[-12:]
+        st.rev += 1
         await self._patch_status(st)
 
     async def _on_stream(self, chat_id: str, content: str, *, reply_to: str | None = None) -> SendResult | None:
@@ -597,7 +621,11 @@ class FrameComposer:
         if st is None:
             return await self._create_card(chat_id, content, reply_to=reply_to)
         # 已有活跃卡片：hermes 分段发送 → 追加段落
-        st.answer_text = (st.answer_text + "\n\n" + content).strip()
+        clean, echo = _strip_command_echo(content)
+        if echo:
+            await self._absorb_status_lines(st, echo)
+        if clean:
+            st.answer_text = (st.answer_text + "\n\n" + clean).strip()
         await self._stream_answer(st)
         return SendResult(success=True, message_id=st.card_message_id)
 
@@ -661,6 +689,9 @@ class FrameComposer:
         st.last_activity = time.monotonic()
         st.finalized = False
         st.degraded = False
+        st.finalized_at = 0.0
+        st.rebuild_only = False
+        st.rev += 1
         # v2.0.26：clarify 暂停族字段随回合重置（prev 复用连续性——上一回合
         # 残留的暂停态不得渗透进新回合）。
         st.pause_pending = False
@@ -710,6 +741,11 @@ class FrameComposer:
         client = self._get_client()
         if client is None:
             raise RuntimeError("card client unavailable")
+        st.rev += 1
+        # v2.0.30：复活卡（streaming 已关）→ 全量重建，stream_element 会 300309。
+        if st.rebuild_only:
+            await self._patch_status(st)
+            return
         st.seq += 1
         st.last_activity = time.monotonic()
         await call_with_seq_recovery(
@@ -792,6 +828,7 @@ class FrameComposer:
         client = self._get_client()
         if client is None:
             raise RuntimeError("card client unavailable")
+        rev = st.rev
         card = self._build_card(
             status_lines=st.status_lines,
             answer_text=st.answer_text,   # 防全量更新把已流 answer 重置为空
@@ -808,6 +845,9 @@ class FrameComposer:
             st,
             lambda seq: client.cardkit_update(st.card_id, card, sequence=seq),
             what="update:status",
+            # v2.0.30 旧快照护栏：定稿后或内容翻版后，这次全量重建已过期，
+            # 迟到落盘会把答案抹成模板占位（2026-11-05 22:47 空卡事故）。
+            guard=lambda: (not st.finalized) and st.rev == rev,
         )
 
     async def _finalize(self, st: CardTurnState, content: str) -> SendResult:
@@ -820,16 +860,23 @@ class FrameComposer:
         # 页脚（三步定稿非事务性）。已定稿直接短路返回成功。
         if st.finalized:
             return SendResult(success=True, message_id=st.card_message_id)
-        st.finalized = True
         if content:
             st.answer_text = content
+        st.rev += 1
         st.last_activity = time.monotonic()
+        # v2.0.30：复活卡（streaming 已关）先全量重建把终值落卡——
+        # finalize_card 的 stream_element 步骤对关闭流式的卡会 300309。
+        if st.rebuild_only:
+            await self._patch_status(st)
+        st.finalized = True
+        st.finalized_at = time.monotonic()
         await finalize_card(
             client, st, answer_element_id=_answer_element_id(),
             footer_fields=self._footer_fields(),
             footer_show_label=self._footer_show_label(),
             panel_title=_panel_title(st.status_lines, elapsed_ms=_turn_elapsed_ms(st)),
             panel_expanded=self._panel_expanded(),
+            skip_answer_patch=st.rebuild_only,
         )
         _logger.info(
             "composer: card finalized chat=%s card=%s answer_len=%d status_lines=%d",
@@ -838,6 +885,48 @@ class FrameComposer:
         return SendResult(success=True, message_id=st.card_message_id)
 
     # ── clarify 暂停/恢复（v2.0.26，同卡续流）────────────────────────────
+    def _settle_new_frame(self, chat_id: str, turn_id: str | None) -> None:
+        """同一 turn 的后继帧到达时的收尾处理（v2.0.30）.
+
+        两件事：
+
+        1. **撤销普通落定窗口**：finalize 帧进暂停窗口后，若窗口内来了新帧，
+           说明那帧不是回合终点（hermes 在「先给一段文字、再继续调工具」时
+           会发真终帧）；旧逻辑不撤销 → 定时器到点把卡封了，后续帧无活跃卡
+           → 建新卡。这是「一个提问 3 张卡」的机械原因。
+        2. **复活同 turn 已定稿的卡**：窗口已过、卡已封，但 turn_id 相同
+           （同一个用户回合的后续段）→ 复活同一张卡继续写。流式已关闭，
+           设 ``rebuild_only`` 后续改走 cardkit_update 全量重建。
+
+        跨 turn（turn_id 变化）不复活——那是新回合，理应新卡。
+        """
+        st = self._states.get(chat_id)
+        if st is None:
+            return
+        if st.pause_pending and not st.paused:
+            self._cancel_pause(chat_id)
+            st.pause_pending = False
+        tid = (turn_id or "").strip()
+        if not tid:
+            return  # 无 turn_id（mock/直调）不做复活——保持旧“封卡即新卡”语义
+        if not st.finalized or not st.card_id:
+            return
+        if st.turn_id and tid != st.turn_id:
+            return
+        if not st.turn_id:
+            return
+        if time.monotonic() - (st.finalized_at or 0.0) > _REVIVE_WINDOW_SEC:
+            return
+        st.finalized = False
+        st.rebuild_only = True
+        st.paused = False
+        st.pause_pending = False
+        st.last_activity = time.monotonic()
+        _logger.info(
+            "composer: card revived for same turn chat=%s card=%s turn=%s",
+            chat_id, st.card_id, (tid or "-")[:8],
+        )
+
     async def suspend_for_clarify(self, chat_id: str, question: str = "") -> bool:
         """clarify 交互卡发出前调用：活跃流式卡进入「等待澄清」暂停态.
 
@@ -1218,6 +1307,41 @@ def _split_native_composite(text: str) -> tuple[str, list[str]]:
 
 
 # ── clarify 暂停/恢复 helpers（v2.0.26，同卡续流）────────────────────────────
+def _strip_command_echo(answer: str) -> tuple[str, list[str]]:
+    """剥掉正文里的命令回显块，返回 ``(正文, 命令行列表)``（v2.0.30）.
+
+    事故（2026-11-06 07:14，kai fork 现场）：卡片正文里堆了 20 多个
+    ```` ```plain_text ... ``` ```` 裸围栏块，一条回答被切成 3 张卡、面板只记
+    7 个工具（真实 54 次）。这些块是 hermes native 通道的进度 overlay
+    （``run_turn_progress._progress_terminal_blocks``：连续 terminal 调用省略
+    工具名 header，只发裸围栏），一旦混进 answer 快照就会永久留在正文。
+
+    判据刻意收窄：只认 info string **恰好**为 ``plain_text`` 的围栏。真实回答
+    的代码块要么带语言（```bash/```python），要么是裸 ```，不会用 plain_text
+    ——它是 hermes 内部进度标记，误伤概率≈0。
+    剥出的命令行交回调用方并入面板（面板才是它们该待的地方）。
+    """
+    lines = (answer or "").splitlines()
+    kept: list[str] = []
+    echo: list[str] = []
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() == "```plain_text":
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith("```"):
+                j += 1
+            body = [ln for ln in lines[i + 1:j] if ln.strip()]
+            if j < len(lines) and body:  # 闭合存在且块非空 → 回显块
+                echo.extend(ln.strip() for ln in body)
+                i = j + 1
+                continue
+        kept.append(lines[i])
+        i += 1
+    if not echo:
+        return answer or "", []
+    return "\n".join(kept).strip(), echo
+
+
 def _is_clarify_placeholder(text: str) -> bool:
     """hermes clarify 边界占位文案判定（stream_consumer._finalize_boundary_stream：
     accumulated 为空时 finalize_text = ``t("gateway.clarify.native_stream_placeholder")``

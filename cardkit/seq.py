@@ -43,13 +43,22 @@ async def call_with_seq_recovery(
     send: Callable[[int], Awaitable[Any]],
     *,
     what: str,
+    guard: Callable[[], bool] | None = None,
 ) -> None:
     """执行 ``send(st.seq)``；300317 时本地 seq 对齐服务端（+1）重发同内容.
 
     ``st`` 需带可变 ``seq`` 属性（composer CardTurnState / finalize state）。
     非冲突异常原样上抛；冲突超过上限同样上抛（交由降级红线兜住消息不丢）。
+
+    ``guard``（v2.0.30）：每次（含自愈重发前）调用；返回 False 则放弃本次发送。
+    用途 = 旧快照护栏：卡已定稿或内容已翻版（``st.rev`` 变化）时，网络重试
+    迟到的全量快照不得再落盘（2026-11-05 22:47 空卡事故：面板刷新挂 27s，
+    定稿后被它按旧快照整卡重建，答案被抹回空白）。
     """
     for attempt in range(_MAX_SEQ_RECOVERIES):
+        if guard is not None and not guard():
+            _logger.debug("cardkit: %s dropped by guard (stale snapshot)", what)
+            return
         try:
             await send(st.seq)
             return

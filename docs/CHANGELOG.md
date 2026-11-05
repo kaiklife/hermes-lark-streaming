@@ -1,5 +1,15 @@
 # 更新日志
 
+## v2.0.30（2026-11-06，kai fork）
+
+| 类型 | 变更 |
+|------|------|
+| 修复 | 一回合多卡：同 `turn_id` 的后继帧撤销落定窗口；已按段定稿的同 turn 卡**复活**（流式已关 → 走 `cardkit_update` 全量重建，`stream_element` 会 300309）。实测「为什么昨晚有个空卡片」一个提问曾产出 3 张卡（答案 554/1690/1291、页脚 1m15s/2m12s/1m33s 互相矛盾） |
+| 修复 | 正文堆命令回显：native 进度 overlay 的裸 ```` ```plain_text ```` 围栏块混进 answer 快照 → 正文 20+ 个命令块、面板只记 7 个工具（真实 54 次）。新增 `_strip_command_echo`：按 info string 精确剥离并回灌面板（真实代码块带语言名/裸围栏，不受影响） |
+| 修复 | 旧快照擦卡：面板全量重建请求挂 27s，定稿后被 300317 自愈重发，按旧快照整卡重建 → 答案抹回占位、页脚消失（11-05 22:47 空卡）。`call_with_seq_recovery` 新增 `guard`：`st.rev` 变化或已定稿即拒绝（含自愈重发） |
+| 新增 | `CardTurnState` 三个字段：`rev`（内容版本）、`finalized_at`（复活窗口基准）、`rebuild_only`（关闭流式后的重建通道） |
+| 验证 | 全量 pytest 781 passed（3 个失败为 HEAD 既存：`test_v210_notice_rows` / `test_v212_layout_md`×2，与本次改动无关）；新增 `tests/e2e/test_v2030_kaifork_cardfix.py` 13 项 |
+
 ## v2.0.29（2026-10-27）
 
 | 类型 | 变更 |

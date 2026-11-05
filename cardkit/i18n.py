@@ -12,9 +12,10 @@ __all__ = [
 _LOCALES = ["zh_cn", "en_us"]
 
 _T: dict[str, tuple[str, str]] = {
-    "status_completed": ("Completed", "已完成"),
-    "status_error": ("Error", "出错"),
-    "status_stopped": ("Stopped", "已停止"),
+    # kai fork（2026-10-30）：V2 丢掉了 V1 状态 emoji，补回
+    "status_completed": ("✅ Completed", "✅ 已完成"),
+    "status_error": ("❌ Error", "❌ 出错"),
+    "status_stopped": ("⏸️ Stopped", "⏸️ 已停止"),
     "elapsed": ("Elapsed {}", "耗时 {}"),
     "context": ("Context {}", "上下文 {}"),
     "processing": ("Processing...", "处理中..."),
