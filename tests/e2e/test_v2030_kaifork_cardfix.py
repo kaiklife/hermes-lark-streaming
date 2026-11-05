@@ -23,7 +23,8 @@ import pytest
 from hermes_lark_streaming.cardkit.seq import call_with_seq_recovery
 from hermes_lark_streaming.composer.engine import (
     CardTurnState,
-    _strip_command_echo,
+    _detach_tool_echoes,
+    _merge_resumed_answer,
 )
 
 from .test_v208_stream_quality import _settle
@@ -37,44 +38,54 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 # ---------------------------------------------------------------------------
 
 
-class TestStripCommandEcho:
-    def test_strips_plain_text_fences(self):
+class TestDetachToolEchoes:
+    def test_strips_head_plus_fence_blocks(self):
         answer = (
             "结论先说：\n\n"
-            "```plain_text\nls -lt ~/.hermes/logs/\n```\n"
-            "```plain_text\ncat /etc/hosts\n```\n"
-            "下面是细节。"
-        )
-        clean, echo = _strip_command_echo(answer)
+            "💻 terminal\n```\nls -lt ~/.hermes/logs/\n```\n"
+            "💻 terminal\n```\ncat /etc/hosts\n```\n"
+            "下面是细节。")
+        clean, echo = _detach_tool_echoes(answer)
         assert clean == "结论先说：\n\n下面是细节。"
         assert echo == ["ls -lt ~/.hermes/logs/", "cat /etc/hosts"]
 
     def test_keeps_language_fenced_code(self):
         answer = "用法：\n```bash\nsherlock torvalds\n```\n完。"
-        clean, echo = _strip_command_echo(answer)
-        assert clean == answer
-        assert echo == []
+        assert _detach_tool_echoes(answer) == (answer, [])
 
-    def test_keeps_bare_fence(self):
+    def test_keeps_bare_fence_without_head(self):
         answer = "```\nplain block\n```"
-        assert _strip_command_echo(answer) == (answer, [])
+        assert _detach_tool_echoes(answer) == (answer, [])
 
     def test_unterminated_fence_untouched(self):
-        answer = "```plain_text\nno closing fence"
-        assert _strip_command_echo(answer) == (answer, [])
+        answer = "💻 terminal\n```\nno closing fence"
+        assert _detach_tool_echoes(answer) == (answer, [])
 
     def test_plain_answer_untouched(self):
-        assert _strip_command_echo("就是一句话") == ("就是一句话", [])
+        assert _detach_tool_echoes("就是一句话") == ("就是一句话", [])
+
+    def test_dedup_suffix_after_fence_dropped(self):
+        answer = "💻 terminal\n```\nwhoami\n```\n(×2)"
+        clean, echo = _detach_tool_echoes(answer)
+        assert clean == "" and echo == ["whoami"]
 
     async def test_echo_blocks_go_to_panel_not_answer(self):
         client = _FullClient()
         comp = _make_composer(client)
         chat = "oc_echo"
-        frame = "```plain_text\nls -lt ~/.hermes/logs/\n```\n\n🛠 正在排查"
+        frame = "💻 terminal\n```\nls -lt ~/.hermes/logs/\n```\n\n🛠 正在排查"
         await comp.handle_stream_frame(chat, frame, finalize=False, turn_id="t1")
         st = comp._states[chat]
-        assert "plain_text" not in st.answer_text
+        assert "```" not in st.answer_text
         assert any("ls -lt ~/.hermes/logs/" in line for line in st.status_lines)
+
+
+class TestResumeMergeIdempotent:
+    def test_snapshot_including_base_not_duplicated(self):
+        assert _merge_resumed_answer("A\n\nB", "A\n\nB C") == "A\n\nB C"
+
+    def test_plain_segment_join_still_works(self):
+        assert _merge_resumed_answer("A", "B") == "A\n\nB"
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +123,19 @@ class TestSameTurnSingleCard:
         await self._seal_first_segment(comp, client, chat)
         await comp.handle_stream_frame(chat, "另一回合", finalize=False, turn_id="t2")
         assert client._n == 2
+
+    async def test_empty_finalize_frame_keeps_settle_window(self):
+        """空终帧（关空气泡）不算续写，落定窗口必须留着。"""
+        client = _FullClient()
+        comp = _make_composer(client)
+        comp._clarify_suspend_sec = 1.2
+        chat = "oc_empty"
+        await comp.handle_stream_frame(chat, "", finalize=False, turn_id="t1")
+        await comp.handle_stream_frame(chat, "答案", finalize=True, turn_id="t1")
+        await comp.handle_stream_frame(chat, "", finalize=False, turn_id="t1")
+        st = comp._states[chat]
+        assert st.pause_pending is True, "空帧不能拆掉落定窗口"
+        assert chat in comp._pause_timers
 
     async def test_finalize_frame_is_cancelled_by_next_frame(self):
         client = _FullClient()

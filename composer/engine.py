@@ -342,7 +342,11 @@ class FrameComposer:
                 if key in st.tool_durations:
                     break  # 最近同工具行已挂 → 属更新调用，行未到 → pending
                 st.tool_durations[key] = label
-                await self._patch_status(st)
+                st.rev += 1
+                # 持 chat 锁：本方法是唯一不持锁的 _patch_status 写者，
+                # 与 finalize 并发时会把旧快照压到已定稿的卡上（v2.0.30 审查 P1）。
+                async with self._chat_lock(chat_id):
+                    await self._patch_status(st)
                 return
             queue = st.pending_tool_durations.setdefault(tool_name, [])
             if len(queue) < 4:
@@ -520,11 +524,11 @@ class FrameComposer:
                 answer, progress = _split_native_composite(text)
                 # v2.0.30：漏进正文的命令回显块（```plain_text 围栏）挪进面板，
                 # 别让它们糊在答案里（2026-11-06 07:14 事故）。
-                answer, _echo = _strip_command_echo(answer)
+                answer, _echo = _detach_tool_echoes(answer)
                 if _echo:
                     progress = list(progress) + _echo
                 # v2.0.30：同一 turn 的后继帧——复活已封的卡 / 撤销普通落定窗口
-                self._settle_new_frame(chat_id, turn_id)
+                self._settle_new_frame(chat_id, turn_id, has_content=bool(answer.strip() or progress))
                 if progress:
                     st_now = self.active_state(chat_id)
                     if st_now is not None:
@@ -621,7 +625,7 @@ class FrameComposer:
         if st is None:
             return await self._create_card(chat_id, content, reply_to=reply_to)
         # 已有活跃卡片：hermes 分段发送 → 追加段落
-        clean, echo = _strip_command_echo(content)
+        clean, echo = _detach_tool_echoes(content)
         if echo:
             await self._absorb_status_lines(st, echo)
         if clean:
@@ -815,6 +819,7 @@ class FrameComposer:
         new_times = _reconcile_line_times(st.status_lines, st.line_times, merged)
         st.status_lines = merged[-12:]
         st.line_times = new_times[-12:]
+        st.rev += 1
         await self._patch_status(st)
         return SendResult(success=True, message_id=st.card_message_id)
 
@@ -885,7 +890,7 @@ class FrameComposer:
         return SendResult(success=True, message_id=st.card_message_id)
 
     # ── clarify 暂停/恢复（v2.0.26，同卡续流）────────────────────────────
-    def _settle_new_frame(self, chat_id: str, turn_id: str | None) -> None:
+    def _settle_new_frame(self, chat_id: str, turn_id: str | None, *, has_content: bool = True) -> None:
         """同一 turn 的后继帧到达时的收尾处理（v2.0.30）.
 
         两件事：
@@ -901,9 +906,11 @@ class FrameComposer:
         跨 turn（turn_id 变化）不复活——那是新回合，理应新卡。
         """
         st = self._states.get(chat_id)
-        if st is None:
+        if st is None or not has_content:
             return
-        if st.pause_pending and not st.paused:
+        # 空帧（hermes 会发 send_stream_frame("", finalize=True) 关闭空气泡）不
+        # 代表后有续写，拆掉落定窗口会让卡一直等 watchdog（v2.0.30 审查 P0-4）。
+        if st.pause_pending and not st.paused and (turn_id or st.turn_id or "").strip():
             self._cancel_pause(chat_id)
             st.pause_pending = False
         tid = (turn_id or "").strip()
@@ -922,6 +929,7 @@ class FrameComposer:
         st.paused = False
         st.pause_pending = False
         st.last_activity = time.monotonic()
+        self._arm_watchdog(chat_id)  # 复活后重新武装孤儿卡兜底
         _logger.info(
             "composer: card revived for same turn chat=%s card=%s turn=%s",
             chat_id, st.card_id, (tid or "-")[:8],
@@ -965,6 +973,7 @@ class FrameComposer:
                 st.status_lines.append(row)
                 st.line_times.append(time.monotonic())
             st.last_activity = time.monotonic()
+            st.rev += 1
             await self._patch_status(st)
             _logger.info(
                 "composer: clarify suspend chat=%s card=%s question=%r",
@@ -1307,33 +1316,53 @@ def _split_native_composite(text: str) -> tuple[str, list[str]]:
 
 
 # ── clarify 暂停/恢复 helpers（v2.0.26，同卡续流）────────────────────────────
-def _strip_command_echo(answer: str) -> tuple[str, list[str]]:
-    """剥掉正文里的命令回显块，返回 ``(正文, 命令行列表)``（v2.0.30）.
+_TOOL_ECHO_HEAD_RE = re.compile(
+    r"^[\U0001F300-\U0001FAFF\u2600-\u27BF]\ufe0f?\s*[a-z][a-z0-9_]*$")
 
-    事故（2026-11-06 07:14，kai fork 现场）：卡片正文里堆了 20 多个
-    ```` ```plain_text ... ``` ```` 裸围栏块，一条回答被切成 3 张卡、面板只记
-    7 个工具（真实 54 次）。这些块是 hermes native 通道的进度 overlay
-    （``run_turn_progress._progress_terminal_blocks``：连续 terminal 调用省略
-    工具名 header，只发裸围栏），一旦混进 answer 快照就会永久留在正文。
 
-    判据刻意收窄：只认 info string **恰好**为 ``plain_text`` 的围栏。真实回答
-    的代码块要么带语言（```bash/```python），要么是裸 ```，不会用 plain_text
-    ——它是 hermes 内部进度标记，误伤概率≈0。
-    剥出的命令行交回调用方并入面板（面板才是它们该待的地方）。
+def _detach_tool_echoes(answer: str) -> tuple[str, list[str]]:
+    """剥掉正文里的「工具回显块」，返回 ``(正文, 命令行列表)``（v2.0.30）.
+
+    事故（2026-11-06 07:14）：卡片正文里堆了 20+ 个命令块，一条回答被切成
+    3 张卡、面板只记 7 个工具。块的真实形态是 hermes 进度 overlay 的
+    **裸围栏** ``💻 terminal\\n```\\n<cmd>\\n``` ``（run_turn_progress.py:289
+    无 info string），漏进 answer 快照后永久留在正文。
+
+    判据只认 hermes 专属形态：**单行「emoji + 工具名」标题**紧跟围栏块。
+    真实回答不会单独出现 ``💻 terminal`` 这种行（要引用命令会写说明文字），
+    所以误伤面≈0；带语言名的代码块、裸围栏（无标题行）一律不动。
     """
     lines = (answer or "").splitlines()
     kept: list[str] = []
     echo: list[str] = []
     i = 0
     while i < len(lines):
-        if lines[i].strip() == "```plain_text":
+        raw = lines[i].strip()
+        if _TOOL_ECHO_HEAD_RE.match(raw):
             j = i + 1
-            while j < len(lines) and not lines[j].strip().startswith("```"):
-                j += 1
-            body = [ln for ln in lines[i + 1:j] if ln.strip()]
-            if j < len(lines) and body:  # 闭合存在且块非空 → 回显块
-                echo.extend(ln.strip() for ln in body)
-                i = j + 1
+            consumed: list[str] = []
+            while j < len(lines):
+                cur = lines[j].strip()
+                if not cur:
+                    j += 1
+                    continue
+                if not cur.startswith("```"):
+                    break
+                k = j + 1
+                body: list[str] = []
+                while k < len(lines) and not lines[k].strip().startswith("```"):
+                    body.append(lines[k].strip())
+                    k += 1
+                if k >= len(lines):  # 未闭合 → 不当回显
+                    break
+                consumed.extend(ln for ln in body if ln)
+                j = k + 1
+                # 去重后缀 (×N) 跟在闭合围栏的下一行
+                if j < len(lines) and re.fullmatch(r"\(×\d+\)", lines[j].strip()):
+                    j += 1
+            if consumed:
+                echo.extend(consumed)
+                i = j
                 continue
         kept.append(lines[i])
         i += 1
@@ -1390,6 +1419,12 @@ def _merge_resumed_answer(resume_base: str, snapshot: str) -> str:
     if not base:
         return snap
     if not snap:
+        return base
+    # v2.0.30：cumulative 快照已包含 base（工具边界定稿后复活 / 同段重放）
+    # 时不能二次拼接，否则正文出现「A B / B C」重复。
+    if snap == base or snap.startswith(base):
+        return snap
+    if base.endswith(snap):
         return base
     return f"{base}\n\n{snap}"
 

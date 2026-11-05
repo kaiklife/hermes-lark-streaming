@@ -1,5 +1,18 @@
 # 更新日志
 
+## v2.0.31（2026-11-06，kai fork）—— 一轮审查后的修正
+
+| 类型 | 变更 |
+|------|------|
+| 修复 | **回显剥离换了判据**：v2.0.30 按 ```` ```plain_text ```` 精确匹配是错的——hermes 进度块是**裸围栏**（`run_turn_progress.py:289` 无 info string），`plain_text` 只是飞书把无语言围栏渲染出来的样子，全机 `grep '```plain_text'` 零命中 → 旧逻辑永不触发。改为 `_detach_tool_echoes`：只认「单行 emoji+工具名标题 + 紧随围栏块」这一 hermes 专属形态（真实回答不会单独出现 `💻 terminal` 这种行），并顺带吃掉闭合围栏后的 `(×N)` 去重后缀 |
+| 修复 | **复活不再重复拼正文**：`_merge_resumed_answer` 幂等化——快照已包含 base（工具边界定稿后复活 / 同段重放）直接返回快照，不再 `base + 快照`。审查给出实测反例：clarify + 段定稿 + 复活 → `A B / B C` |
+| 修复 | **空终帧不再拆掉落定窗口**：hermes 会发 `send_stream_frame("", finalize=True)` 关空气泡；旧逻辑无条件撤窗口 → 卡停在未定稿态等 120s watchdog。现在只有带内容（answer 或 progress 非空）的帧才撤销，且要求 turn 上下文存在 |
+| 修复 | **耗时回灌持 chat 锁**：`_feed_tool_duration` 原先是唯一不持锁的 `_patch_status` 写者——27s 挂起能与 finalize 并行的根因 |
+| 修复 | 补齐 `rev` bump：`_on_interim` / `suspend_for_clarify` / `_feed_tool_duration`（旧版漏掉 → 带 `💬 等待你的选择...` 占位的旧快照能通过护栏落盘） |
+| 修复 | 复活后重挂 watchdog（`_arm_watchdog`），长回合复活卡不再无人兜底 |
+| 验证 | 真飞书 API 探针（只建卡不发送，零可见噪声）：`stream_element` 关流式后 → 300309 拒绝；**`cardkit_update` 关流式后 → OK**（连续两次 OK）；`batch_update` 插页脚 → OK。复活通道成立 |
+| 验证 | 全量 pytest **785 passed**（3 个失败为 HEAD 既存，改动前即挂）；`test_v2030_kaifork_cardfix.py` 17 项全绿 |
+
 ## v2.0.30（2026-11-06，kai fork）
 
 | 类型 | 变更 |
