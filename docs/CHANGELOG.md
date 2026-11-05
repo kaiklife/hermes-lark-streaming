@@ -1,5 +1,21 @@
 # 更新日志
 
+## v2.0.32（2026-11-06，kai fork）—— 二轮审查后的收敛
+
+| 类型 | 变更 |
+|------|------|
+| 修复 | **回显判据收紧到真源**：hermes 只有 `terminal` 发裸围栏块（`run_turn_progress.py:275`），且围栏恒为裸 ```。v2.0.31 的「emoji+任意小写词」标题行会把 `✅ done` / `💡 tip` 后的**答案代码块**当回显吞掉（正文丢失）。现在只认 `<emoji> terminal` 标题 + 裸围栏，带 info string 的一律是正文 |
+| 修复 | **回显不再进面板预算**：剥掉即弃。面板已有真实工具行，塞命令正文会把 12 行预算挤满（实测 20 个回显挤掉 `read_file` 行） |
+| 修复 | **clarify 恢复正文重复根治**：`_merge_resumed_answer` 补「段内增长」重叠拼接（base 尾与 snap 头重叠时只接增量）。hermes 边界会 reset accumulated，snap 逐帧生长，旧版每帧复制一遍尾段（平方级膨胀） |
+| 修复 | **空 seed 帧不再阻断复活**：`has_content` 只用于「撤落定窗口」，复活段无条件执行。否则 clarify 窗口内封卡 + 空 seed → 同回合又变两张卡 |
+| 修复 | **GC 冷却对齐复活窗口**：已定稿状态回收从固定 60s 改为 `_REVIVE_WINDOW_SEC`（600s），否则长工具回合（>60s）复活必然落空，机制等于没修 |
+| 修复 | **其余正文写入点统一过剥离**：`_create_card` 首段 / `_patch_answer`（edit 通道）/ `_finalize` 终值 |
+| 修复 | **耗时回灌去掉锁与即时整卡重建**：只写 `tool_durations` + bump rev，渲染交给下一帧/定稿（工具密集回合不再堆几十次 full rebuild）。旧快照由 `rev`/`finalized` guard 拦 |
+| 修复 | 复活卡定稿跳过二次 `close_streaming`（`skip_close`）——已关过的卡再关是未验证路径；页脚照常重插（全量重建会抹掉旧页脚） |
+| 修复 | 看门狗句柄去重（每 chat 至多一个 pending，docstring 语义真正落地） |
+| 新增 | `scripts/probe_closed_card.py`：真飞书探针（只建卡不发送），复核「关流式后能否 update / 插页脚」 |
+| 验证 | 全量 pytest **787 passed**（3 个失败为 HEAD 既存）；`test_v2030_kaifork_cardfix.py` 20 项全绿，新增「答案自己的 ```python 块不被吞」「非 terminal emoji 行算正文」回归 |
+
 ## v2.0.31（2026-11-06，kai fork）—— 一轮审查后的修正
 
 | 类型 | 变更 |

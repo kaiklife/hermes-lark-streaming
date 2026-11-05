@@ -203,12 +203,16 @@ async def finalize_card(
     panel_title: str = "",
     panel_expanded: bool = True,
     skip_answer_patch: bool = False,
+    skip_close: bool = False,
 ) -> None:
     """把活跃卡片转为终态（四步，见模块 docstring）.
 
     ``skip_answer_patch``（v2.0.30）：复活卡通道已走全量重建（正文随
     cardkit_update 落卡），跳过 stream_element 终值 patch（关闭流式后
     该接口报 300309）。
+
+    ``skip_close``（v2.0.32）：复活卡在上一段已 ``close_streaming``，再关一次
+    是未验证的 API 路径（真机探针只验过 update/batch_update），跳过。
     """
     client.cardkit_stream_element  # noqa: B018 — 提前触发 attribute 错误便于诊断
     state.seq += 1
@@ -280,6 +284,10 @@ async def finalize_card(
                 "composer: panel reseal skipped (non-fatal) card=%s",
                 str(state.card_id)[:12], exc_info=True,
             )
+    if skip_close:
+        _logger.debug("composer: close_streaming skipped (revived card) card=%s",
+                      str(state.card_id)[:12])
+        return
     state.seq += 1
     # v2.0.21（审计 R3）：关流式装饰性化——此前失败上抛 → _degrade → 卡片
     # 通道退役 + 官方回落路径要么被幂等守卫短路（跑马灯永挂：流式模式未关，

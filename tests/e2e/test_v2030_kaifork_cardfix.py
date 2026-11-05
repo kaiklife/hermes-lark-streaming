@@ -69,7 +69,8 @@ class TestDetachToolEchoes:
         clean, echo = _detach_tool_echoes(answer)
         assert clean == "" and echo == ["whoami"]
 
-    async def test_echo_blocks_go_to_panel_not_answer(self):
+    async def test_echo_blocks_dropped_from_answer(self):
+        """回显块剥掉即弃（面板已有真实工具行，不让命令正文吃 12 行预算）。"""
         client = _FullClient()
         comp = _make_composer(client)
         chat = "oc_echo"
@@ -77,7 +78,20 @@ class TestDetachToolEchoes:
         await comp.handle_stream_frame(chat, frame, finalize=False, turn_id="t1")
         st = comp._states[chat]
         assert "```" not in st.answer_text
-        assert any("ls -lt ~/.hermes/logs/" in line for line in st.status_lines)
+        assert "ls -lt" not in st.answer_text
+        assert "正在排查" in st.answer_text
+
+    async def test_answer_keeps_own_code_block_after_echo(self):
+        """剥掉回显后，答案自己的带语言代码块必须留着。"""
+        frame = ("💻 terminal\n```\nls\n```\n"
+                 "```python\nprint(1)\n```\n结论")
+        clean, echo = _detach_tool_echoes(frame)
+        assert "print(1)" in clean and "```python" in clean
+        assert echo == ["ls"]
+
+    def test_non_terminal_emoji_line_is_prose(self):
+        for text in ("✅ done\n```bash\nmake test\n```", "💡 tip\n```\n记住 sudo\n```"):
+            assert _detach_tool_echoes(text) == (text, [])
 
 
 class TestResumeMergeIdempotent:

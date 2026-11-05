@@ -231,7 +231,9 @@ class TestGcIdleRecycle:
         comp = self._comp()
         st = CardTurnState(chat_id="c1")
         st.finalized = True
-        st.last_activity = time.monotonic() - 61
+        # v2.0.32：冷却对齐复活窗口（_REVIVE_WINDOW_SEC），不再固定 60s
+        from hermes_lark_streaming.composer.engine import _REVIVE_WINDOW_SEC
+        st.last_activity = time.monotonic() - (_REVIVE_WINDOW_SEC + 1)
         comp._states["c1"] = st
         comp._by_message["om_x"] = "c1"
         st.card_message_id = "om_x"

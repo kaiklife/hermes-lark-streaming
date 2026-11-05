@@ -48,8 +48,8 @@ _logger = logging.getLogger("hermes_lark_streaming.composer")
 _WATCHDOG_IDLE_SEC = 120.0
 
 # v2.0.30（kai fork）：同 turn 复活窗口。卡按段定稿后，同 turn_id 的后继帧在
-# 此窗口内继续写同一张卡（203 = 三次以上工具墙钟仍能落在同一卡上，超时说明
-# 这已是另一个回合的迟到帧，宁可新卡也不误拼）。
+# 此窗口内继续写同一张卡。v2.0.32 起 _gc 的「已定稿冷却」也用它，否则 60s
+# 回收让长工具回合的复活必然落空（审查实测 61s 后同 turn 一分为二）。
 _REVIVE_WINDOW_SEC = 600.0
 
 try:  # hermes 运行时存在；导入失败时 composer 退化为纯直通（tests / 无 hermes 环境）
@@ -155,6 +155,8 @@ class FrameComposer:
         # v2.0.26：per-chat 暂停窗口落定定时器（loop.call_later，与看门狗同款
         # 架构——句柄不在 all_tasks() 中，到期才建 task）。
         self._pause_timers: dict[str, asyncio.TimerHandle] = {}
+        # v2.0.32：看门狗句柄（每 chat 至多一个 pending，docstring 语义落地）
+        self._watchdog_timers: dict[str, asyncio.TimerHandle] = {}
         self._states: dict[str, CardTurnState] = {}
         self._by_message: dict[str, str] = {}  # card_message_id -> chat_id
         # v2.0.11 P0：per-chat 帧处理串行化锁（见模块头并发模型说明）。
@@ -193,7 +195,9 @@ class FrameComposer:
         for cid, st in self._states.items():
             idle = now - st.last_activity
             if st.finalized:
-                if idle > 60:
+                # v2.0.32：冷却对齐复活窗口——60s 就把状态回收会让「同 turn
+                # 复活」在长工具（>60s）后失效，等于一回合多卡照旧。
+                if idle > _REVIVE_WINDOW_SEC:
                     stale.append(cid)
             elif st.paused or st.pause_pending:
                 # v2.0.26：clarify 暂停/窗口期豁免——hermes clarify 硬超时
@@ -342,11 +346,11 @@ class FrameComposer:
                 if key in st.tool_durations:
                     break  # 最近同工具行已挂 → 属更新调用，行未到 → pending
                 st.tool_durations[key] = label
+                # v2.0.32：只记数据不发 API——本方法在帧处理链之外，即时
+                # _patch_status 会在工具密集回合堆出几十次整卡重建；下一帧 /
+                # 定稿的渲染会从 st.tool_durations 取到标签（不丢），旧快照
+                # 由 _patch_status 的 rev/finalized guard 拦住。
                 st.rev += 1
-                # 持 chat 锁：本方法是唯一不持锁的 _patch_status 写者，
-                # 与 finalize 并发时会把旧快照压到已定稿的卡上（v2.0.30 审查 P1）。
-                async with self._chat_lock(chat_id):
-                    await self._patch_status(st)
                 return
             queue = st.pending_tool_durations.setdefault(tool_name, [])
             if len(queue) < 4:
@@ -524,9 +528,9 @@ class FrameComposer:
                 answer, progress = _split_native_composite(text)
                 # v2.0.30：漏进正文的命令回显块（```plain_text 围栏）挪进面板，
                 # 别让它们糊在答案里（2026-11-06 07:14 事故）。
+                # 回显行不进面板：面板已有真实工具行，塞命令正文会把 12 行预算
+                # 挤满（实测 20 个回显把 read_file 行挤掉）。剥掉即弃。
                 answer, _echo = _detach_tool_echoes(answer)
-                if _echo:
-                    progress = list(progress) + _echo
                 # v2.0.30：同一 turn 的后继帧——复活已封的卡 / 撤销普通落定窗口
                 self._settle_new_frame(chat_id, turn_id, has_content=bool(answer.strip() or progress))
                 if progress:
@@ -625,9 +629,7 @@ class FrameComposer:
         if st is None:
             return await self._create_card(chat_id, content, reply_to=reply_to)
         # 已有活跃卡片：hermes 分段发送 → 追加段落
-        clean, echo = _detach_tool_echoes(content)
-        if echo:
-            await self._absorb_status_lines(st, echo)
+        clean, _echo = _detach_tool_echoes(content)
         if clean:
             st.answer_text = (st.answer_text + "\n\n" + clean).strip()
         await self._stream_answer(st)
@@ -711,7 +713,7 @@ class FrameComposer:
         st.pending_status.clear()
         self._states[chat_id] = st
         self._by_message[st.card_message_id] = chat_id
-        st.answer_text = content or ""
+        st.answer_text = _detach_tool_echoes(content or "")[0]
         st.seq += 1
         if st.answer_text:
             await call_with_seq_recovery(
@@ -729,7 +731,9 @@ class FrameComposer:
         return SendResult(success=True, message_id=st.card_message_id)
 
     async def _patch_answer(self, st: CardTurnState, content: str) -> SendResult:
-        st.answer_text = content if content is not None else st.answer_text
+        if content is not None:
+            content, _echo = _detach_tool_echoes(content)
+            st.answer_text = content
         await self._stream_answer(st)
         return SendResult(success=True, message_id=st.card_message_id)
 
@@ -866,6 +870,7 @@ class FrameComposer:
         if st.finalized:
             return SendResult(success=True, message_id=st.card_message_id)
         if content:
+            content, _echo = _detach_tool_echoes(content)
             st.answer_text = content
         st.rev += 1
         st.last_activity = time.monotonic()
@@ -882,6 +887,7 @@ class FrameComposer:
             panel_title=_panel_title(st.status_lines, elapsed_ms=_turn_elapsed_ms(st)),
             panel_expanded=self._panel_expanded(),
             skip_answer_patch=st.rebuild_only,
+            skip_close=st.rebuild_only,
         )
         _logger.info(
             "composer: card finalized chat=%s card=%s answer_len=%d status_lines=%d",
@@ -906,11 +912,11 @@ class FrameComposer:
         跨 turn（turn_id 变化）不复活——那是新回合，理应新卡。
         """
         st = self._states.get(chat_id)
-        if st is None or not has_content:
+        if st is None:
             return
         # 空帧（hermes 会发 send_stream_frame("", finalize=True) 关闭空气泡）不
         # 代表后有续写，拆掉落定窗口会让卡一直等 watchdog（v2.0.30 审查 P0-4）。
-        if st.pause_pending and not st.paused and (turn_id or st.turn_id or "").strip():
+        if has_content and st.pause_pending and not st.paused and (turn_id or st.turn_id or "").strip():
             self._cancel_pause(chat_id)
             st.pause_pending = False
         tid = (turn_id or "").strip()
@@ -1052,8 +1058,11 @@ class FrameComposer:
         loop = self._loop
         if loop is None or loop.is_closed():
             return
+        if chat_id in self._watchdog_timers:
+            return  # 已有 pending 句柄，重复武装无意义
         try:
-            loop.call_later(_WATCHDOG_IDLE_SEC, self._watchdog_due, chat_id)
+            self._watchdog_timers[chat_id] = loop.call_later(
+                _WATCHDOG_IDLE_SEC, self._watchdog_due, chat_id)
         except RuntimeError:  # loop 已停转（跨线程窗口）
             pass
         except Exception:
@@ -1061,6 +1070,7 @@ class FrameComposer:
 
     def _watchdog_due(self, chat_id: str) -> None:
         """定时器到期回调（loop 线程）：静默达标 → 落定；仍活跃 → 重新武装."""
+        self._watchdog_timers.pop(chat_id, None)
         try:
             st = self._states.get(chat_id)
             if st is None or st.finalized or st.degraded:
@@ -1316,8 +1326,11 @@ def _split_native_composite(text: str) -> tuple[str, list[str]]:
 
 
 # ── clarify 暂停/恢复 helpers（v2.0.26，同卡续流）────────────────────────────
+# 真源：hermes 只有 terminal 走 _progress_terminal_blocks（run_turn_progress.py:275
+# `tool_name == "terminal"`），header 是 i18n `{emoji} {tool}`，围栏恒为裸 ```（无
+# info string）。收紧到这个形态，别的「emoji + 单词」行（✅ done / 💡 tip）不算。
 _TOOL_ECHO_HEAD_RE = re.compile(
-    r"^[\U0001F300-\U0001FAFF\u2600-\u27BF]\ufe0f?\s*[a-z][a-z0-9_]*$")
+    r"^[\U0001F300-\U0001FAFF\u2600-\u27BF]\ufe0f?\s*terminal$")
 
 
 def _detach_tool_echoes(answer: str) -> tuple[str, list[str]]:
@@ -1346,7 +1359,7 @@ def _detach_tool_echoes(answer: str) -> tuple[str, list[str]]:
                 if not cur:
                     j += 1
                     continue
-                if not cur.startswith("```"):
+                if cur != "```":      # 只吞裸围栏；```bash 等带语言的一律是正文
                     break
                 k = j + 1
                 body: list[str] = []
@@ -1426,6 +1439,11 @@ def _merge_resumed_answer(resume_base: str, snapshot: str) -> str:
         return snap
     if base.endswith(snap):
         return base
+    # 段内增长（clarify 边界 reset 后快照逐帧生长）：base 尾部与 snap 头部重叠时
+    # 只接上不重叠的部分，否则每帧都复制一遍尾段。
+    for k in range(min(len(base), len(snap)), 0, -1):
+        if base.endswith(snap[:k]):
+            return base + snap[k:]
     return f"{base}\n\n{snap}"
 
 
